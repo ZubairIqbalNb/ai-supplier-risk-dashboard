@@ -2,9 +2,10 @@
 
 Phase 2 multi-source retrieval project for the AI Engineering Masters Program.
 
-**Current status: Module 1 only.** This repository currently contains the
-project foundation and configuration layer. No retrieval engines, data stores,
-DSPy synthesis, evaluation pipeline, or UI are implemented yet.
+**Current status: Modules 1–2.** The repository contains the project foundation
+and configuration layer plus the Module 2 supplier data contracts and
+deterministic synthetic dataset. No retrieval engines, data stores, DSPy
+synthesis, evaluation pipeline, or UI are implemented yet.
 
 ## Assignment domain
 
@@ -49,6 +50,26 @@ Copy `.env.example` to `.env` and fill in credentials locally. Never commit
 An existing `GEMINI_MODEL` value in a local `.env` is left untouched but is not
 used by the final teacher/student model split.
 
+## Module 2 dataset
+
+Module 2 defines strict Pydantic contracts for supplier profiles, annual
+delivery metrics, contract and complaint text, and ownership links. It also
+generates a reproducible 24-supplier dataset with a 14 train / 4 development /
+6 held-out split. Supplier-to-partition membership is fixed by ID range and
+enforced during validation, so the counts cannot be preserved by swapping IDs
+between partitions.
+
+```bash
+uv run --locked python -m supplier_risk.data.generate
+uv run --locked pytest tests/test_contracts.py tests/test_dataset.py -q
+```
+
+The default output, `data/generated/suppliers.json`, is Git-ignored. The dataset
+is entirely synthetic. Field definitions, units, validation rules, and
+partition/leakage controls are in [`docs/schema.md`](docs/schema.md), which also
+records proposed physical schemas for SQLite, FAISS metadata, and Neo4j. Those
+store designs are not implemented in Module 2.
+
 ## Commands
 
 ```bash
@@ -70,9 +91,10 @@ make check        # lint + typecheck + test
 
 ## Scope
 
-Module 1 is limited to repository foundation, configuration, and tests.
-Later modules add the data stores, retrieval, DSPy synthesis, evaluation, and
-UI in separately reviewed steps.
+Modules 1–2 cover repository foundation, configuration, canonical supplier
+data contracts, and a deterministic synthetic dataset. Later modules add the
+data stores, retrieval, DSPy synthesis, evaluation, and UI in separately
+reviewed steps. Module 2 does not populate any store or implement risk scoring.
 
 Deployment is deferred until the missing “Vibe Coding Helper Doc” is supplied
 or deployment is explicitly waived.
@@ -80,7 +102,13 @@ or deployment is explicitly waived.
 ## Limitations
 
 - The 0–100 risk score, evidence-status field, citation schema, and banned-word
-  list are provisional engineering choices.
-- The dataset split is provisional at 14 train / 4 development / 6 held-out.
+  list are provisional engineering choices and are not implemented yet.
+- The 24-supplier dataset and 14 train / 4 development / 6 held-out split are
+  implemented but remain provisional design choices. The assignment only
+  requires ~20–30 entities and a held-out entity outside training.
+- Ownership currently supports one optional parent link per supplier. Multiple
+  parents, nested ownership, and traversal depth remain open design decisions
+  for the Neo4j module.
+- Synthetic data cannot support claims of meaningful model accuracy.
 - DSPy, Gemini model access, CPU PyTorch/FAISS compatibility, and Neo4j driver
   compatibility have not yet been verified.

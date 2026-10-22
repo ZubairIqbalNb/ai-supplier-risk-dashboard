@@ -49,7 +49,7 @@ Missing: the “Vibe Coding Helper Doc” referenced in Guide Step 10. Deploymen
 | R-23 | README documents architecture diagram, tech stack, and full setup for all three databases including Neo4j Docker commands. | Problem Statement p.3; Guide p.3 Step 10 | Documentation | Mandatory | README review; fresh setup |
 | R-24 | Setup instructions are followable by someone other than the author, end to end. | Guide p.3 Step 10 | Documentation / Operational | Mandatory | Independent reviewer checklist |
 | R-25 | Out of scope: LangGraph, tool loops, multi-agent supervisors, production observability, caching, fallback cascades. DSPy synthesis is one compiled module call. | Problem Statement p.3 | Constraint | Mandatory | Dependency and architecture audit |
-| R-26 | One-page schema note covering all three stores before domain code. | Guide p.2 Step 1 | Documentation / Data | Mandatory | docs/DATA_MODEL.md review |
+| R-26 | One-page schema note covering all three stores before domain code. | Guide p.2 Step 1 | Documentation / Data | Mandatory | `docs/schema.md` review |
 | R-27 | All three engines return genuinely different information for the same entity, not duplicated content. | Problem Statement p.3 | Evaluation | Mandatory | Diversity report; overlap metric |
 | R-28 | Degrade gracefully when one engine is down, for example Neo4j not running. | Problem Statement p.3; Guide p.2 Step 4 | Operational / Evaluation | Mandatory | Stop Neo4j; verify contexts and statuses |
 | R-29 | Deploy per Vibe Coding Helper Doc; note local or hosted Neo4j requirement. | Guide p.3 Step 10 | Operational / Documentation | Blocked | Missing helper document |
@@ -59,11 +59,14 @@ Missing: the “Vibe Coding Helper Doc” referenced in Guide Step 10. Deploymen
 
 These decisions are engineering choices, not verified assignment requirements:
 
-- 24 suppliers, with a provisional 14 train / 4 development / 6 held-out split.
+- 24 suppliers and a 14 train / 4 development / 6 held-out split. Implemented
+  in Module 2, but still a provisional engineering choice; the assignment only
+  requires approximately 20–30 entities and a held-out entity outside training.
 - SQLite column names and synthetic metric distributions.
-- Neo4j ownership schema and 3-hop traversal limit.
+- Neo4j ownership schema (Module 2 implements one optional parent link per
+  supplier) and a future 3-hop traversal limit.
 - Real BM25 + FAISS dense retrieval + reciprocal rank fusion.
-- Pydantic v2 contracts.
+- Pydantic v2 contracts. Implemented in Module 2 (`src/supplier_risk/contracts.py`).
 - Streamlit as the UI framework.
 - 0–100 risk score, `evidence_status`, citation schema, summary length, and
   banned-word list.
@@ -90,3 +93,36 @@ These decisions are engineering choices, not verified assignment requirements:
 
 Module 1 implements repository foundation, configuration, and tests only. It
 does not implement any retrieval, graph, DSPy, evaluation, or UI behavior.
+
+## Module 2 status
+
+Module 2 implements the canonical raw supplier data contracts, a deterministic
+synthetic dataset generator, data-integrity tests, and the schema note. The
+schema note preserves its one-page store summary and adds proposed physical
+schemas for SQLite, FAISS metadata, and Neo4j; none of those stores is populated
+in Module 2.
+
+Evidence:
+
+- **R-26:** `docs/schema.md` documents the supplier entity, the structured
+  delivery/defect records intended for SQLite, contract/complaint text intended
+  for FAISS, and ownership links intended for Neo4j. It labels each area as
+  assignment-mandated, implemented, proposed, or open.
+- **R-06:** the fixed manifest contains 24 fictional suppliers, inside the
+  required 20–30 range. Counts are asserted by tests.
+- **Partition integrity:** `PARTITION_ID_RANGES` is the single source of truth
+  for supplier-to-partition membership. Validation rejects a swapped assignment
+  even when the 14/4/6 counts are unchanged, and the generator uses the same
+  mapping.
+- **R-21 (preparation):** the dataset provides 6 held-out suppliers with
+  identities separate from training and development. Evaluation itself is not
+  implemented in Module 2.
+- **R-05 / R-07 remain open:** Module 2 generates and validates the source
+  dataset only. It does not create SQLite tables, FAISS indexes, or Neo4j nodes
+  and edges. Store population belongs to later modules.
+- **R-01:** the domain and intended store mapping are recorded; the
+  `APPROVE` / `FLAG` verdict contract is deferred to the synthesis module.
+
+Module 2 does not add retrieval, graph persistence, DSPy, Gemini calls, scoring,
+evaluation, or UI behavior. The provisional fields (0–100 score, evidence
+status, citations) remain unimplemented.
