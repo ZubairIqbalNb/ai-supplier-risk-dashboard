@@ -63,8 +63,9 @@ These decisions are engineering choices, not verified assignment requirements:
   in Module 2, but still a provisional engineering choice; the assignment only
   requires approximately 20–30 entities and a held-out entity outside training.
 - SQLite column names and synthetic metric distributions.
-- Neo4j ownership schema (Module 2 implements one optional parent link per
-  supplier) and a future 3-hop traversal limit.
+- Neo4j ownership schema (one optional parent link per supplier), the
+  `Supplier`/`Company` labels, and the 3-hop / 25-relationship query limits.
+  Implemented in Module 4 (`src/supplier_risk/graph/`).
 - Real BM25 + FAISS dense retrieval + reciprocal rank fusion. Implemented in
   Module 3 (`src/supplier_risk/retrieval/`).
 - Pydantic v2 contracts. Implemented in Module 2 (`src/supplier_risk/contracts.py`).
@@ -78,7 +79,8 @@ These decisions are engineering choices, not verified assignment requirements:
 - One document per contract/complaint record, `IndexFlatIP` cosine search,
   BM25 `k1=1.5`/`b=0.75`, tokenizer `module3.v1`, `RRF k = 60`, and the
   `artifacts/retrieval/` artifact layout. Implemented in Module 3.
-- Local-first Docker Neo4j.
+- Local-first Docker Neo4j 5 Community with a named data volume and
+  loopback-only published ports. Implemented in `compose.yaml`.
 
 ## Resolved conflicts
 
@@ -150,28 +152,30 @@ Evidence:
 - **R-07 (partially implemented):** contracts and complaints are chunked as one
   document per record, embedded locally with `all-MiniLM-L6-v2`, and persisted
   as `dense.index.faiss` plus JSON metadata under `artifacts/retrieval/`. The build
-  prints document, index, and fingerprint counts. SQLite tables and Neo4j nodes
-  and edges remain unimplemented.
+  prints document, index, and fingerprint counts. Module 4 adds Neo4j nodes and
+  typed ownership edges; SQLite tables remain unimplemented.
 - **R-08 (partially implemented):** `query_faiss(entity)` in
   `src/supplier_risk/retrieval/pipeline.py` accepts a supplier id or exact legal
   name and returns a labeled `[FAISS]` context string covering only contract and
   complaint documents, with a tagged `[FAISS ERROR]` string for unknown
-  suppliers and unavailable artifacts. `query_sql` and `query_graph` do not
-  exist yet.
-- **R-04 (partially implemented):** hybrid search, BM25, and RRF are
-  implemented; text-to-SQL, Neo4j GraphRAG, DSPy, parallel retrieval, and
+  suppliers and unavailable artifacts. Module 4 adds the corresponding
+  `query_graph(entity)`; `query_sql` does not exist yet.
+- **R-04 (partially implemented):** hybrid search, BM25, RRF, and the Neo4j
+  ownership graph are implemented; text-to-SQL, DSPy, parallel retrieval, and
   LLM-as-judge are not.
-- **R-02 / R-11 / R-12 (not implemented):** retrieval is single-engine and
-  synchronous. There is no ThreadPoolExecutor, no three-engine orchestration,
-  and no latency comparison.
-- **R-27 (not demonstrated):** the FAISS wrapper returns only document text. The
-  cross-engine diversity check requires SQL and graph contexts that do not exist
-  yet.
+- **R-02 / R-11 / R-12 (not implemented):** each engine is callable
+  individually, but retrieval is synchronous. There is no ThreadPoolExecutor,
+  no three-engine orchestration, and no latency comparison.
+- **R-27 (not demonstrated):** the FAISS wrapper returns document text and the
+  graph wrapper returns ownership edges. The cross-engine diversity check still
+  requires the SQL context and a side-by-side comparison that do not exist yet.
 - **R-30 (partial gate):** the FAISS/BM25 engine passes its own smoke tests
-  (offline suite plus opt-in real-model tests). DSPy synthesis must still wait
-  for the SQL and graph engines.
+  (offline suite plus opt-in real-model tests), and Module 4 adds the graph
+  engine's own offline and live smoke tests. DSPy synthesis must still wait for
+  the SQL engine.
 - **R-05 (partially satisfied):** the generator plus the Module 3 build populate
-  the semantic store; no store population exists for SQLite or Neo4j.
+  the semantic store; Module 4 populates Neo4j. No store population exists for
+  SQLite.
 - **Artifact integrity:** loading validates the manifest, corpus fingerprint,
   counts, index dimension/type/vector count, vector-to-document mapping, the
   duplicated dense identity fields, embedding model, tokenizer version, BM25
@@ -181,9 +185,57 @@ Evidence:
   `RetrievalArtifactError`. Tests are in `tests/test_retrieval_dense.py`,
   `tests/test_retrieval_lexical.py`, `tests/test_retrieval_embeddings.py`, and
   `tests/test_retrieval_pipeline.py`.
-- **R-26 (extended):** `docs/schema.md` section 9 now documents the implemented
-  retrieval artifacts and labels the still-proposed SQLite and Neo4j schemas as
-  unimplemented.
+- **R-26 (extended):** `docs/schema.md` section 9 documents the implemented
+  retrieval artifacts. Module 4 updates section 10 to the implemented graph
+  schema; only the SQLite design remains proposed.
 
 Module 3 adds no SQLite, Neo4j, DSPy, Gemini, scoring, evaluation, or UI code.
 It reads no environment variables and makes no external LLM calls.
+
+## Module 4 status
+
+Module 4 implements the ownership graph store: Neo4j 5 persistence, a
+deterministic and conflict-checked ingestion command, uniqueness constraints,
+bounded traversal, and the assignment-facing `query_graph(entity)` wrapper.
+SQLite, parallel orchestration, DSPy, the judge, and the UI remain
+unimplemented.
+
+Evidence:
+
+- **R-07 (graph portion implemented):** `python -m supplier_risk.graph.ingest`
+  loads the canonical dataset, validates every ownership record, writes 24
+  `Supplier` nodes, 10 `Company` nodes, and 24 typed ownership edges, and prints
+  node/edge counts. Repeated runs create zero nodes and zero relationships.
+  Tests: `tests/test_graph_schema.py`, `tests/test_graph_store.py`, and the
+  opt-in `tests/test_graph_integration.py`.
+- **R-08 (graph portion implemented):** `query_graph(entity)` in
+  `src/supplier_risk/graph/pipeline.py` accepts a supplier id or exact legal
+  name and returns a labeled `[GRAPH]` context. Unknown suppliers, invalid
+  configuration, an unavailable database, timeouts, and integrity failures
+  return `[GRAPH ERROR]` strings. `query_sql` remains absent.
+- **R-10 (graph portion implemented):** the graph wrapper converts every typed
+  graph error into a tagged string instead of crashing; no-evidence queries are
+  successful `[GRAPH]` contexts with zero relationships. Tests:
+  `tests/test_graph_pipeline.py` and the unavailable/closed-store integration
+  tests.
+- **R-04 / R-01 (partially implemented):** Neo4j ownership retrieval is real,
+  but text-to-SQL, GraphRAG synthesis, DSPy, parallel orchestration, judging,
+  scoring, and the APPROVE/FLAG verdict are not implemented.
+- **R-26 (extended):** `docs/schema.md` section 10 documents node labels, stable
+  keys, relationship type/direction, the two uniqueness constraints, traversal
+  semantics (3 hops, 25 relationships, path cap, deterministic ordering),
+  ingestion conflict rules, and current limitations.
+- **R-23 (partially satisfied):** README documents Neo4j's role, placeholder
+  configuration variables, Compose startup/health/stop commands, ingestion, and
+  both test modes. Deployment and third-party setup review remain outstanding.
+- **R-28 (partially demonstrated):** `query_graph` returns a tagged error for an
+  unreachable Neo4j instance, and this is tested. A parallel orchestrator that
+  keeps SQL + FAISS running when Neo4j is down does not exist yet.
+- **R-02 / R-11 / R-12 (not implemented):** the graph engine is individually
+  callable but not fired in parallel with the SQL and FAISS engines.
+- **R-30 (partial gate):** the graph engine passes its own offline and live
+  smoke tests. DSPy must still wait for the SQL engine.
+
+Module 4 adds no SQLite, DSPy, Gemini, scoring, evaluation, or UI code. It reads
+only the three `NEO4J_*` settings, makes no external LLM calls, and never
+returns a legal-control or risk verdict from ownership data alone.

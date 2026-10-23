@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "faiss-cpu>=1.9,<2",
+    "neo4j>=5.15,<6",
     "numpy>=1.26,<3",
     "pydantic>=2.11,<3",
     "python-dotenv>=1.0,<2",
@@ -46,6 +47,7 @@ pythonpath = ["."]
 addopts = "-ra"
 markers = [
     "real_model: downloads and runs the local sentence-transformer model; opt in with SUPPLIER_RISK_REAL_MODEL_TESTS=1",
+    "neo4j: requires the local Neo4j Compose service; opt in with SUPPLIER_RISK_NEO4J_TESTS=1",
 ]
 
 [tool.ruff]

@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal, cast
+from typing import Final, Literal, cast
+from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
@@ -15,10 +16,67 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 _DEFAULT_NEO4J_URI = "bolt://localhost:7687"
 _DEFAULT_NEO4J_USER = "neo4j"
 _DEFAULT_LOG_LEVEL: LogLevel = "INFO"
+_NEO4J_URI_SCHEMES: Final = frozenset({"bolt", "neo4j", "bolt+s", "bolt+ssc", "neo4j+s", "neo4j+ssc"})
 
 
 class ConfigError(Exception):
     """Raised when required configuration is missing or invalid."""
+
+
+class Neo4jSettings(BaseModel):
+    """Validated Neo4j connection settings for the Module 4 graph store.
+
+    The password is required here even though it is optional in
+    :class:`Settings`, because the graph engine cannot run without one. Values
+    are never included in representations or error messages.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    uri: str = _DEFAULT_NEO4J_URI
+    user: str = _DEFAULT_NEO4J_USER
+    password: SecretStr
+
+    @field_validator("uri")
+    @classmethod
+    def _uri_is_a_bolt_or_neo4j_endpoint(cls, value: str) -> str:
+        text = value.strip()
+        parts = urlsplit(text)
+        if parts.scheme not in _NEO4J_URI_SCHEMES or not parts.hostname:
+            raise ValueError("NEO4J_URI must be a bolt:// or neo4j:// URI with a host")
+        if parts.username is not None or parts.password is not None:
+            raise ValueError(
+                "NEO4J_URI must not include credentials; use NEO4J_USER and NEO4J_PASSWORD"
+            )
+        return text
+
+    @field_validator("user")
+    @classmethod
+    def _user_must_not_be_blank(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("NEO4J_USER must not be blank")
+        return text
+
+    @field_validator("password")
+    @classmethod
+    def _password_must_not_be_blank(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("NEO4J_PASSWORD must not be blank")
+        return value
+
+    def masked(self) -> dict[str, str]:
+        """Return a display-safe representation without the password."""
+        return {
+            "uri": self.uri,
+            "user": self.user,
+            "password": "***",
+        }
+
+    def __repr__(self) -> str:
+        return f"Neo4jSettings({self.masked()!r})"
+
+    __str__ = __repr__
 
 
 class Settings(BaseModel):
@@ -105,6 +163,16 @@ def _sanitized_validation_message(error: ValidationError) -> str:
     return f"Invalid configuration for: {unique_locations}"
 
 
+def _load_environment(
+    env_file: str | Path | None,
+    environ: Mapping[str, str] | None,
+) -> Mapping[str, str]:
+    """Resolve configuration values without mutating the process environment."""
+    if environ is not None:
+        return environ
+    return {**_read_env_file(env_file), **os.environ}
+
+
 def load_settings(
     env_file: str | Path | None = ".env",
     environ: Mapping[str, str] | None = None,
@@ -115,10 +183,7 @@ def load_settings(
     Otherwise, values from ``env_file`` are merged with the process environment,
     with process environment values taking precedence.
     """
-    if environ is not None:
-        source: Mapping[str, str] = environ
-    else:
-        source = {**_read_env_file(env_file), **os.environ}
+    source = _load_environment(env_file, environ)
 
     api_key = (source.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -137,5 +202,44 @@ def load_settings(
             neo4j_password=_optional_secret(source.get("NEO4J_PASSWORD")),
             log_level=log_level,
         )
+    except ValidationError as error:
+        raise ConfigError(_sanitized_validation_message(error)) from None
+
+
+def load_neo4j_settings(
+    env_file: str | Path | None = ".env",
+    environ: Mapping[str, str] | None = None,
+) -> Neo4jSettings:
+    """Load and validate the Neo4j connection settings.
+
+    This loader is independent of ``GEMINI_API_KEY`` so graph-only commands and
+    tests never need a language-model credential. When ``environ`` is supplied,
+    the dotenv file is not read at all.
+
+    Raises:
+        ConfigError: if a required Neo4j variable is missing or invalid. Error
+            messages name the variables only; values are never echoed.
+    """
+    source = _load_environment(env_file, environ)
+    uri = (source.get("NEO4J_URI") or _DEFAULT_NEO4J_URI).strip()
+    user = (source.get("NEO4J_USER") or _DEFAULT_NEO4J_USER).strip()
+    password = _optional_secret(source.get("NEO4J_PASSWORD"))
+
+    missing = [
+        name
+        for name, value in (
+            ("NEO4J_URI", uri),
+            ("NEO4J_USER", user),
+            ("NEO4J_PASSWORD", password),
+        )
+        if value is None or (isinstance(value, str) and not value)
+    ]
+    if missing:
+        names = ", ".join(missing)
+        raise ConfigError(f"Missing or blank required environment variable(s): {names}")
+    assert password is not None
+
+    try:
+        return Neo4jSettings(uri=uri, user=user, password=password)
     except ValidationError as error:
         raise ConfigError(_sanitized_validation_message(error)) from None

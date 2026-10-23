@@ -1,0 +1,35 @@
+# Local development services for the Supplier Risk Dashboard.
+#
+# Neo4j 5 supplies the ownership/subsidiary graph. Credentials come from the
+# Git-ignored `.env` file; `docker compose` reads it automatically. Only the
+# Bolt and HTTP ports are published, and only on the loopback interface.
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: supplier-risk-neo4j
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    environment:
+      NEO4J_AUTH: ${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:?NEO4J_PASSWORD must be set in .env}
+      NEO4J_server_memory_heap_initial__size: 512m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          cypher-shell -u "$${NEO4J_AUTH%%/*}" -p "$${NEO4J_AUTH#*/}"
+          "RETURN 1" >/dev/null 2>&1
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 40s
+
+volumes:
+  neo4j_data:
+  neo4j_logs:

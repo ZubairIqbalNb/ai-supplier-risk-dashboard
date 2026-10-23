@@ -1,21 +1,24 @@
-# Supplier Data Schema (Modules 2–3)
+# Supplier Data Schema (Modules 2–4)
 
 **Project:** AI Supplier Risk Dashboard  
 **Phase:** Phase 2 — Multi-Source Retrieval  
-**Versions:** `module2.v1` (source dataset), `module3.v1` (retrieval artifacts)  
-**Status:** Module 2 data foundation and Module 3 document retrieval implemented
+**Versions:** `module2.v1` (source dataset), `module3.v1` (retrieval artifacts), Neo4j graph schema from Module 4
 
-This note defines the canonical raw supplier data used by later modules and the
-document-retrieval artifacts built from it. Module 2 generates and validates the
-source records. Module 3 builds a deterministic document corpus, a persisted
-FAISS dense index, and a persisted BM25 lexical index, and serves hybrid
-retrieval with Reciprocal Rank Fusion. SQLite and Neo4j are still **not**
+**Status:** Module 2 data foundation, Module 3 document retrieval, and Module 4 ownership graph implemented
+
+This note defines the canonical raw supplier data used by later modules, the
+document-retrieval artifacts built from it, and the Neo4j ownership graph.
+Module 2 generates and validates the source records. Module 3 builds a
+deterministic document corpus, a persisted FAISS dense index, and a persisted
+BM25 lexical index, and serves hybrid retrieval with Reciprocal Rank Fusion.
+Module 4 validates the ownership records and writes the supplier/company graph
+to Neo4j, with bounded `query_graph(entity)` retrieval. SQLite is still **not**
 populated, and no scoring, DSPy synthesis, or UI exists.
 
 **Status legend**
 
 - **Mandated** — required by the assignment PDFs.
-- **Implemented** — present in Module 2 code and covered by tests.
+- **Implemented** — present in Module 2–4 code and covered by tests.
 - **Proposed** — future-store design recorded here; not implemented.
 - **Open** — requires a design decision or approval before implementation.
 
@@ -75,9 +78,9 @@ These are project choices, not assignment-mandated values:
 `SupplierRecord` and `SupplierDataset` are the source-of-truth containers used
 to generate all three stores consistently. Sections 3–7 add field-level
 validation detail; the table above is the single-page summary. Section 8
-records the **proposed** SQLite schema and section 10 the **proposed** Neo4j
-schema; both remain unimplemented. Section 9 documents the **implemented**
-Module 3 document-retrieval artifacts.
+records the **proposed** SQLite schema, which remains unimplemented. Section 9
+documents the **implemented** Module 3 document-retrieval artifacts, and
+section 10 the **implemented** Module 4 Neo4j graph.
 
 ## 3. Canonical records
 
@@ -158,7 +161,7 @@ record exists in this synthetic dataset; it is not evidence of low risk.**
 ### 3.5 `OwnershipLink`
 
 An ownership link between a parent company and a supplier. The contract records
-both sides by id; section 10 describes the proposed Neo4j edge direction.
+both sides by id; section 10 documents the implemented Neo4j edge direction.
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
@@ -179,8 +182,8 @@ supplier has a known parent.
 **Current limitation:** a supplier has **at most one** optional parent link.
 The model does not represent multiple parents, parent-of-parent chains, or a
 company hierarchy. The assignment names a “subsidiary/ownership graph” but does
-not specify graph depth or ownership cardinality; see section 13 for the open
-decision that must be resolved before Neo4j implementation.
+not specify graph depth or ownership cardinality. Module 4 implements this
+one-parent model faithfully; see section 13 for the expansion decision.
 
 ### 3.6 `SupplierRecord`
 
@@ -682,27 +685,32 @@ engines in parallel, evaluate retrieval quality, or implement DSPy, the judge,
 scoring, or the UI. `query_faiss` is one document-retrieval function, not a
 multi-engine query.
 
-## 10. Proposed Neo4j graph schema
+## 10. Implemented Neo4j graph schema (Module 4)
 
-**Status:** Proposed. Module 2 does not start Neo4j, create constraints, or write
-nodes or relationships. No driver is installed.
+**Status:** Implemented in `src/supplier_risk/graph/`. Module 4 starts no
+container by itself; it connects to the Neo4j 5 service defined in
+`compose.yaml`. Ingestion and retrieval are covered by the tests listed in
+section 10.7.
 
 ### 10.1 Nodes
 
 | Label | Identifying key | Properties | Uniqueness constraint |
 |---|---|---|---|
-| `Supplier` | `supplier_id` | `supplier_id`, `legal_name`, `country_code`, `sector`, `partition` | `REQUIRE s.supplier_id IS UNIQUE` |
-| `Company` | `parent_company_id` | `parent_company_id`, `parent_company_name` | `REQUIRE c.parent_company_id IS UNIQUE` |
+| `Supplier` | `supplier_id` | `supplier_id`, `legal_name`, `country_code`, `sector`, `partition` | `supplier_id_unique`: `REQUIRE s.supplier_id IS UNIQUE` |
+| `Company` | `parent_company_id` | `parent_company_id`, `parent_company_name` | `company_id_unique`: `REQUIRE c.parent_company_id IS UNIQUE` |
 
 A supplier maps one-to-one to a `Supplier` node whose key is the same
-`supplier_id` used in SQLite and FAISS metadata. Parent companies are `Company`
-nodes; they are not suppliers and their ids never overlap the `SUP-` namespace.
+`supplier_id` used in the SQLite design and FAISS metadata. Parent companies
+are `Company` nodes; their `ORG-NNN` identifiers are validated never to overlap
+the `SUP-NNN` namespace. Only validated profile fields are copied; contract,
+complaint, and metric data stay in their own stores.
 
 ### 10.2 Relationships
 
-The current contract stores a parent id and a child supplier id plus a
-`relationship_type`. The proposed mapping uses that type as the relationship
-type and attaches the percentage:
+The contract stores the parent company id/name, the child supplier id, the
+percentage, and a `relationship_type`. Module 4 uses that type as the
+relationship type and attaches the percentage, with the edge stored child
+supplier → parent company:
 
 ```cypher
 (:Supplier {supplier_id: "SUP-011"})
@@ -716,42 +724,123 @@ type and attaches the percentage:
 
 Meaning: the supplier is a subsidiary of, or in a joint venture with, the
 company, and `ownership_percentage` is the company's ownership share of the
-supplier. The direction (supplier → company) is chosen to match the field names
-`child_supplier_id` and `parent_company_id`; the source contract stores the same
-edge as parent fields pointing at a child, so the loader must reverse the
-storage direction rather than the meaning.
+supplier (0–100, not a 0–1 fraction). Direction follows the contract fields
+`child_supplier_id` and `parent_company_id`; the source contract nests the edge
+under the child record, so ingestion reverses the storage nesting, not the
+meaning.
 
-`ownership_percentage` is the only relationship property in the current
-contract. It is a fraction of 100, not a fraction of 1, consistent with
-`OwnershipLink`.
+`SUBSIDIARY_OF` requires `ownership_percentage > 50`; `JOINT_VENTURE_WITH`
+requires `ownership_percentage <= 50`. These rules are validated again in the
+graph plan even though the Module 2 contract already enforces them.
 
-### 10.3 Idempotent writes and duplicate parents
+### 10.3 Traversal semantics and limits
 
-- Load companies before suppliers, or use `MERGE` on the identifying key.
-- `MERGE (c:Company {parent_company_id: row.parent_company_id})` creates each
-  company once, regardless of how many suppliers share it.
-- On an existing company, compare `parent_company_name` with the incoming value
-  and abort on mismatch. The dataset validator already rejects an id mapped to
-  two names.
-- `MERGE (s:Supplier {supplier_id: row.child_supplier_id})`.
-- `MERGE (s)-[r:SUBSIDIARY_OF]->(c) SET r.ownership_percentage = ...` (or the
-  joint-venture type) makes re-running the loader idempotent.
+`query_graph(entity)` resolves a supplier id (case-insensitive) or an exact
+legal name (case-insensitive), then discovers ownership relationships within a
+bounded neighborhood:
 
-### 10.4 Indexes
+- **Maximum 3 relationship hops.** The Cypher pattern is the bounded
+  `[:SUBSIDIARY_OF|JOINT_VENTURE_WITH*1..3]`; unbounded `*` traversal is never
+  used.
+- **At most 200 paths** are read from Neo4j per query. This limits worst-case
+  path expansion before Python deduplication.
+- **At most 25 ownership relationships** are returned. Relationships are
+  deduplicated by `(child_key, parent_key, type)`; duplicate paths keep the
+  smallest hop count. Ordering is by hop, child key, parent key, then type, so
+  repeated queries produce identical output.
+- **Discovery is undirected, direction is preserved.** The traversal is
+  undirected so a supplier can reach its parent company (1 hop) and fellow
+  subsidiaries of that company (2 hops). Every returned line still renders the
+  stored direction, `child supplier -> parent company`; the query does not
+  invent reverse edges.
+- **A hop is one ownership relationship.** A supplier → company edge is 1 hop;
+  supplier → company ← sibling supplier is 2 hops.
+- If no relationship is returned, the context reports
+  `ownership_relationships=0` and explicitly states that no ownership evidence
+  was found. It does not claim a path exists.
 
-- Unique constraints on `Supplier.supplier_id` and `Company.parent_company_id`
-  as above.
-- Optional index on `Supplier.partition` for evaluation-time filtering.
-- No full-text index is proposed: contract and complaint text belongs to the
-  FAISS store, and duplicating it in Neo4j would undermine the requirement that
-  each engine return different information.
+With the canonical dataset (24 suppliers, 24 ownership links, 10 parent
+companies) every supplier has exactly one edge, so its own evidence is depth 1
+and sibling suppliers appear at depth 2. The 3-hop bound is a safety limit for
+future hierarchy data; no company-to-company edge is present in the canonical
+dataset.
 
-### 10.5 Current graph limitation
+### 10.4 Idempotent ingestion and duplicate prevention
 
-One optional edge per supplier. There are no supplier-to-supplier edges,
-company-to-company edges, multiple parents, nested ownership percentages, or
-arbitrary-depth traversal in the current contract. Section 13 records the
-approval needed before expanding the model.
+`python -m supplier_risk.graph.ingest` (or `make graph-ingest`) performs one
+validated run:
+
+- Loads and re-validates `data/generated/suppliers.json`.
+- Builds a deterministic plan of suppliers, companies, and ownership edges.
+- Rejects unknown endpoints, self-links, duplicate logical edges, more than one
+  ownership edge per supplier, invalid percentages, unsupported relationship
+  types, and parent ids that collide with supplier ids.
+- Verifies that existing edges for canonical suppliers do not point to a
+  different parent or use a different relationship type; such a conflict aborts
+  before writes. A changed percentage is updated from the canonical dataset.
+- Calls `verify_connectivity`, creates both uniqueness constraints with
+  `IF NOT EXISTS`, and writes all nodes and edges in **one transaction**. A
+  failure rolls the transaction back and returns a non-zero exit status.
+- Uses `MERGE` on the stable keys and parameterized `UNWIND` batches. Re-running
+  against the same dataset creates zero nodes and zero relationships.
+- Leaves nodes and edges outside the current dataset untouched. It never wipes
+  the graph and never deletes an unrelated supplier or company.
+
+### 10.5 Query output and failure contract
+
+A successful query starts with `[GRAPH]`, includes supplier identity, scope,
+direction, hop/relationship limits, and one deterministic line per relationship:
+
+```text
+[GRAPH] supplier=SUP-001 name=Norvend Components Ltd partition=train
+scope=ownership-neighborhood direction=child_supplier->parent_company max_hops=3 max_relationships=25 truncated=false
+ownership_relationships=2
+1. hop=1 focus=yes SUP-001 "Norvend Components Ltd" -[JOINT_VENTURE_WITH 40.0%]-> ORG-001 "Meridian Industrial Holdings"
+2. hop=2 focus=no SUP-014 "Lakeshore Carton Supply" -[JOINT_VENTURE_WITH 50.0%]-> ORG-001 "Meridian Industrial Holdings"
+```
+
+`focus=yes` marks the queried supplier's own edge; `focus=no` marks related
+suppliers reached through the same company. The string never asserts legal
+control, sanctions, financial risk, or an APPROVE/FLAG verdict.
+
+Unknown suppliers, ambiguous identities, invalid configuration, an unavailable
+database, query timeouts, and integrity failures return `[GRAPH ERROR]` strings
+instead of raising. The error classes distinguish configuration
+(`GraphConfigError`), connectivity (`GraphConnectionError`), query/timeout
+(`GraphQueryError`), data integrity (`GraphDataIntegrityError`), and unknown or
+ambiguous identity (`UnknownGraphEntityError`). The password is never included
+in a message.
+
+Queries run with a 10-second transaction timeout, a 5-second connection
+timeout, and a 5-second driver retry window. There is no indefinite retry
+loop.
+
+### 10.6 Indexes
+
+Only the two uniqueness constraints above are created. The partition is stored
+as a `Supplier` property but no partition index is created in Module 4; graph
+queries do not currently filter by partition. No full-text index is created:
+contract and complaint text belongs to the FAISS/BM25 store.
+
+### 10.7 Tests
+
+Offline (no database): `tests/test_graph_schema.py`,
+`tests/test_graph_pipeline.py`, `tests/test_graph_store.py`, and
+`tests/test_graph_config.py` for `Neo4jSettings`.
+
+Live (opt-in): `tests/test_graph_integration.py`, enabled with
+`SUPPLIER_RISK_NEO4J_TESTS=1` (or `make test-graph`). The live tests cover
+connectivity, constraints, canonical ingestion, idempotent re-ingestion, edge
+direction, exact-name resolution, unknown and no-evidence behavior, the
+3-hop/25-relationship limits, database unavailability, and connection closure.
+
+### 10.8 Current graph limitations
+
+One optional edge per supplier and no company-to-company edges in the
+canonical dataset. There are no multiple parents, nested ownership
+percentages, or supplier-to-supplier ownership edges. The query is bounded to
+3 hops, but a deeper hierarchy is not supported by the current contract or
+ingestion. Section 13 records the approval needed before expanding the model.
 
 ## 11. Shared identity and partition propagation
 
@@ -781,7 +870,7 @@ their supplier's partition and cannot move independently.
 
 ### Status summary
 
-| Area | Assignment | Module 2 | Later stores |
+| Area | Assignment | Current status | Remaining work |
 |---|---|---|---|
 | Supplier/contract/complaint/ownership fields | Domain-mandated categories | Implemented and validated | Must map these contracts |
 | 24 suppliers, 14/4/6 split | Only ~20–30 and a held-out entity are mandated | Implemented; provisional counts | — |
@@ -789,7 +878,7 @@ their supplier's partition and cannot move independently.
 | SQLite tables | Store population mandated | Not implemented; schema proposed in section 8 | Later module |
 | FAISS documents, embeddings, index | Store population mandated | Implemented in Module 3 (section 9) | Complete for contracts and complaints |
 | BM25 lexical index and RRF hybrid retrieval | Hybrid BM25+dense required | Implemented in Module 3 (section 9) | Complete |
-| Neo4j nodes and edges | Store population mandated | Not implemented; design proposed in section 10 | Later module |
+| Neo4j nodes and edges | Store population mandated | Implemented in Module 4 (section 10) | Complete for the canonical ownership graph |
 | Multi-parent / nested ownership | Unspecified | Not supported | Open decision |
 
 ## 12. Validation errors
@@ -836,8 +925,9 @@ handler is installed, so programming errors still surface.
 1. **Ownership cardinality and depth.** The assignment names a
    subsidiary/ownership graph but does not specify whether a supplier may have
    multiple parents, whether companies may own companies, or how deep traversal
-   must go. The current model supports one optional parent link per supplier.
-   Approve any expansion before Neo4j implementation.
+   must go. The current model supports one optional parent link per supplier and
+   Module 4 implements exactly that; the query is bounded to 3 hops for future
+   data. Approve any expansion of the contract before adding deeper edges.
 2. **Parent-company normalization in SQLite.** Keep repeated parent id/name
    columns in `ownership_links`, or introduce a `parent_companies` table. The
    current proposal keeps the flat representation to avoid implying a hierarchy.
@@ -870,8 +960,9 @@ handler is installed, so programming errors still surface.
 - Ownership is a single optional parent link per supplier; deeper corporate
   structures are unsupported and must not be inferred from the code.
 - Empty complaints mean "no synthetic complaint record", not "no risk".
-- Modules 2–3 do not populate SQLite or Neo4j and do not implement parallel
-  retrieval, risk scoring, DSPy, the judge, or the UI.
+- Module 4 populates Neo4j with the canonical ownership graph. SQLite remains
+  unpopulated, and parallel retrieval, risk scoring, DSPy, the judge, and the UI
+  are not implemented.
 - Retrieval is exact FAISS search over 66 documents; recall, ranking quality, and
   latency at larger corpus sizes are unmeasured.
 - The embedding model, the `4 × top_k` candidate window, and `RRF k = 60` are
