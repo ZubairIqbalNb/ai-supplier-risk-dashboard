@@ -1,14 +1,16 @@
-# Supplier Data Schema (Module 2)
+# Supplier Data Schema (Modules 2–3)
 
 **Project:** AI Supplier Risk Dashboard  
 **Phase:** Phase 2 — Multi-Source Retrieval  
-**Schema version:** `module2.v1`  
-**Status:** Module 2 data foundation; no retrieval, scoring, or AI behavior
+**Versions:** `module2.v1` (source dataset), `module3.v1` (retrieval artifacts)  
+**Status:** Module 2 data foundation and Module 3 document retrieval implemented
 
-This note defines the canonical raw supplier data used by later modules. It
-covers the structured, semantic, and graph stores required by the assignment,
-but Module 2 only generates the validated source records. It does not populate
-SQLite, FAISS, or Neo4j yet.
+This note defines the canonical raw supplier data used by later modules and the
+document-retrieval artifacts built from it. Module 2 generates and validates the
+source records. Module 3 builds a deterministic document corpus, a persisted
+FAISS dense index, and a persisted BM25 lexical index, and serves hybrid
+retrieval with Reciprocal Rank Fusion. SQLite and Neo4j are still **not**
+populated, and no scoring, DSPy synthesis, or UI exists.
 
 **Status legend**
 
@@ -25,6 +27,12 @@ SQLite, FAISS, or Neo4j yet.
 - Structured facts are delivery/defect metrics for SQL.
 - Free text is contract/complaint text for semantic search.
 - Relationships are subsidiary/ownership links for the graph store.
+- Hybrid retrieval must combine BM25 and dense (FAISS) ranking, or exact
+  metadata match with semantic fallback (Problem Statement p.2; Guide p.2
+  Step 3). Module 3 implements real BM25 + dense fusion with RRF.
+- The semantic store chunks and embeds free text locally and persists the index
+  and its metadata (Guide p.2 Step 2). Module 3 implements this for contracts
+  and complaints.
 - The final verdict vocabulary is `APPROVE` / `FLAG`.
 - The generator must be runnable and reproducible (Problem Statement, deliverables).
 - The entity manifest must contain approximately **20–30 fake entities**
@@ -44,6 +52,11 @@ These are project choices, not assignment-mandated values:
 - Fixed supplier-ID ranges for partition membership (enforced, see section 7).
 - Field names, units, numeric ranges, sectors, contract types, complaint
   categories, and the ownership-percentage rule.
+- One searchable document per contract or complaint record (66 documents for
+  seed `20261019`), with the identity scheme in section 9.
+- `sentence-transformers/all-MiniLM-L6-v2` (384 dimensions), `IndexFlatIP` over
+  L2-normalized vectors, BM25 `k1 = 1.5` / `b = 0.75`, RRF `k = 60`, tokenizer
+  `module3.v1`, and the artifact paths in section 9.
 - Supplier/company identifier formats.
 - A single annual (`FY2025`) metrics snapshot per supplier.
 - JSON as the generated dataset format and `20261019` as the default seed.
@@ -61,9 +74,10 @@ These are project choices, not assignment-mandated values:
 
 `SupplierRecord` and `SupplierDataset` are the source-of-truth containers used
 to generate all three stores consistently. Sections 3–7 add field-level
-validation detail; the table above is the single-page summary. Sections 8–11
-record the **proposed** physical schemas for the stores that Module 3+ will
-implement.
+validation detail; the table above is the single-page summary. Section 8
+records the **proposed** SQLite schema and section 10 the **proposed** Neo4j
+schema; both remain unimplemented. Section 9 documents the **implemented**
+Module 3 document-retrieval artifacts.
 
 ## 3. Canonical records
 
@@ -443,92 +457,230 @@ guarantees id-to-name consistency; normalization is an open decision in section
 13. A separate table would also let SQLite express parent/child company
 hierarchies that the current contract does not support.
 
-## 9. Proposed FAISS index and metadata
+## 9. Implemented document retrieval (Module 3)
 
-**Status:** Proposed. Module 2 does not chunk, embed, build an index, or persist
-vectors. No embedding or FAISS dependency is installed.
+**Status:** Implemented. Module 3 builds one searchable document per contract
+and complaint record, persists a FAISS dense index and a BM25 lexical index, and
+serves hybrid retrieval with RRF. No SQLite or Neo4j code is involved.
 
-### 9.1 Source records
+### 9.1 Source records and corpus size
 
-The semantic store uses exactly the free-text records already validated in
+The retrieval corpus uses exactly the free-text records already validated in
 `SupplierRecord`:
 
 - 32 `Contract` records (one or more per supplier).
 - 34 `Complaint` records (zero or more per supplier).
+- 66 documents in total for seed `20261019`.
 
-Those counts are properties of seed `20261019`, not fixed contract rules.
-Contract text currently runs 393–422 characters and complaint text 112–150
-characters, so the whole corpus is small.
+Those counts are properties of the seed, not fixed contract rules. Contract
+text runs 393–422 characters and complaint text 112–150 characters.
 
-### 9.2 Chunking strategy
+### 9.2 Document granularity
 
-- **Proposed initial setting:** one chunk per source record. At current text
-  lengths this preserves the whole agreement or complaint and keeps
-  `source_id` unambiguous.
-- **Proposed fallback:** if a record exceeds a 512-token embedding budget, split
-  it on paragraph, then sentence, boundaries with 64 tokens of overlap. Chunk
-  order must be deterministic.
-- **Implemented:** none. No tokenizer or splitter has been selected.
+One document per source record; no chunking. The texts are far below the
+embedding model's input limit, one agreement or complaint is a useful retrieval
+unit, and a single document id per record keeps the vector-to-source mapping
+unambiguous. No splitter or overlap policy is implemented. If a future dataset
+contains records that exceed the model input window, chunking must be added
+deliberately with deterministic chunk ids and a new artifact version rather than
+retrofitted silently.
 
-### 9.3 Embedding model and index type
+### 9.3 Document identity and searchable text
 
-- **Embedding model:** `sentence-transformers/all-MiniLM-L6-v2` (384
-  dimensions) is recorded as a provisional choice in the traceability register.
-  It is **not yet selected by code** and must be confirmed before Module 3.
-- **FAISS index:** proposed `IndexFlatIP` over L2-normalized vectors, which is
-  exact cosine similarity. Exhaustive search is appropriate for a few dozen
-  chunks. An approximate index (for example HNSW) is unnecessary at this size
-  and is an open decision only if the corpus grows.
-- **Implemented:** none.
+- `document_id` is `"<source_type>:<source_id>"`, for example
+  `contract:CON-001-01` or `complaint:CMP-001-01`. It is derived from the source
+  record, not from a process-random hash, so repeated builds from unchanged
+  input produce identical ids. The `contract:` / `complaint:` prefix prevents
+  collisions between the two source types.
+- Corpus order is deterministic: `supplier_id` ascending, then all contracts,
+  then all complaints, then source-record id. This order is shared by the
+  corpus, FAISS vector ids, and BM25 document positions.
+- The text is a short header followed by the exact source text:
+  - Contract: `Contract <id> for supplier <name> (<supplier_id>), contract type
+    <TYPE>, annual value USD <value>. <contract_text>`
+  - Complaint: `Complaint <id> for supplier <name> (<supplier_id>), category
+    <CATEGORY>, severity <SEVERITY>, received <date>. <complaint_text>`
+- The header makes supplier names, supplier ids, source ids, contract types,
+  severities, and dates searchable as exact terms without stringifying entire
+  Pydantic objects or adding serialization noise.
 
-### 9.4 Proposed artifact paths
+### 9.4 Document metadata fields (implemented)
 
-| Artifact | Path | Contents |
-|---|---|---|
-| FAISS index | `artifacts/faiss/contracts_complaints.faiss` | One vector per chunk |
-| Metadata | `artifacts/faiss/metadata.jsonl` | One JSON object per vector, same order as the index |
-| Manifest | `artifacts/faiss/manifest.json` | Schema version, embedding model, dimension, metric, chunk count, source counts, generator seed |
-
-`artifacts/` and `*.faiss` are already Git-ignored.
-
-### 9.5 Required metadata fields
+Persisted in `corpus.json` and validated on reload. `dense.metadata.json`
+repeats the filterable identity fields for every vector position.
 
 | Field | Type | Purpose |
 |---|---|---|
-| `vector_id` | integer | 0-based position in the FAISS index |
-| `chunk_id` | string | Stable id, e.g. `CON-007-01#0` |
+| `document_id` | string | Stable id, `"<source_type>:<source_id>"` |
 | `source_type` | `"contract"` or `"complaint"` | Source record type |
 | `source_id` | string | `contract_id` or `complaint_id` |
 | `supplier_id` | string | Canonical supplier identity; never omitted |
-| `partition` | `train` / `dev` / `held_out` | Copied from the enclosing supplier record |
-| `chunk_index` | integer | Chunk position within the source record |
-| `text` | string | Exact embedded text |
-| `contract_type` | string or null | Contract-only categorical filter |
+| `supplier_name` | string | Legal name copied from the validated profile |
+| `partition` | `train` / `dev` / `held_out` | Copied from the supplier record |
+| `text` | string | Exact searchable and embedded text |
+| `contract_type` | string or null | Contract-only categorical metadata |
 | `effective_date` | ISO date or null | Contract-only metadata |
-| `severity` | string or null | Complaint-only categorical filter |
-| `category` | string or null | Complaint-only metadata |
+| `expiry_date` | ISO date or null | Contract-only metadata |
+| `annual_value_usd` | integer or null | Contract-only metadata |
 | `received_date` | ISO date or null | Complaint-only metadata |
+| `severity` | string or null | Complaint-only categorical metadata |
+| `category` | string or null | Complaint-only categorical metadata |
 
-`supplier_id` is the stable join key. `source_id` remains the identifier of the
-individual contract or complaint, so a chunk always names both its source record
-and its supplier.
+The document model enforces that contract-only fields are present only on
+contract documents, that complaint-only fields are present only on complaint
+documents, that `document_id` matches the source, that `source_id` matches the
+source-type identifier format, and that `partition` equals
+`partition_for_supplier_id(supplier_id)`.
 
-### 9.6 Ordering and reload alignment
+### 9.5 Dense retrieval
 
-1. Build chunks in one deterministic pass ordered by `supplier_id`, then
-   contracts before complaints, then `chunk_index`.
-2. Embed in that order and add vectors to FAISS without custom ids, so FAISS
-   positional ids are `0..n-1`.
-3. Write metadata rows in the same order with `vector_id` equal to the row
-   index.
-4. On reload, assert `index.ntotal == number of metadata rows`, that
-   `metadata[i]["vector_id"] == i`, and that the loaded dimension, metric, and
-   embedding model match `manifest.json`.
+- **Model:** `sentence-transformers/all-MiniLM-L6-v2`, 384 dimensions, CPU
+  only. It is loaded lazily on first use and reused by the retriever; importing
+  the package never loads or downloads a model. No hosted embedding API is
+  called.
+- **Validation:** embedding matrices must match document count and model
+  dimension, contain only finite values, and contain no zero-length vector.
+  Violations raise `EmbeddingModelError`.
+- **Similarity:** vectors are L2-normalized and added to `faiss.IndexFlatIP`, so
+  inner product equals cosine similarity. Queries are normalized the same way.
+- **Mapping:** FAISS ids are index positions `0..n-1`. `dense.metadata.json`
+  stores one entry per vector with `vector_id`, `document_id`, `supplier_id`,
+  `partition`, and `source_type`.
+- **Lifecycle:** building is an explicit operation. Loading never rebuilds or
+  replaces an index, and a missing, corrupt, wrong-type, wrong-dimension, or
+  misaligned index raises `RetrievalArtifactError`.
 
-This keeps vector ids and metadata aligned across persistence and reload without
-relying on implicit FAISS iteration order. If the corpus is rebuilt with a
-different chunking strategy or embedding model, the manifest and artifact set
-must be regenerated together.
+### 9.6 Lexical retrieval
+
+- **Implementation:** `rank_bm25.BM25Okapi` with `k1 = 1.5` and `b = 0.75`.
+- **Tokenizer (`module3.v1`):** lowercase, then keep maximal runs of ASCII
+  letters and digits, treating `-`, `_`, and `.` as joiners inside a token.
+  Identifiers and numbers survive: `con-001-01`, `sup-007`, `lot-8399`,
+  `fy2025`, `2023-01-01`. A comma is not a joiner, so `12,500` becomes `12`
+  and `500`.
+- **Persistence:** `lexical.json` stores the document ids, their token lists,
+  the tokenizer version, and the BM25 parameters. BM25 is rebuilt from those
+  tokens on load, so no pickle is used and scores are reproducible across
+  process restarts.
+- **Matching:** only documents that contain at least one query token are
+  returned, so a query with no matching term returns no lexical results instead
+  of the whole corpus. BM25 scores are not comparable to cosine scores and are
+  never mixed directly.
+
+### 9.7 Hybrid ranking
+
+`RRF(d) = Σ 1 / (k + rank_i(d))`, with one-based ranks, the standard default
+`k = 60`, and a configurable positive integer constant. Results are
+deduplicated by `document_id`; a document present in both lists sums both
+contributions. A document absent from a list receives no score from it. Ties
+are broken by ascending `document_id`, and `top_k` is applied last. No score
+thresholds are applied. Retrieval results keep the original dense rank,
+lexical rank, and fused score.
+
+### 9.8 Metadata filtering
+
+The query interface filters on exact `supplier_id` and `partition` values from
+the persisted corpus metadata. Filters are applied to both ranked lists before
+fusion, so a document outside the requested supplier or partition can never
+appear in the result.
+
+- When a filter is active, both engines search the whole corpus. This is the
+  documented oversampling strategy: a 66-document corpus makes exhaustive search
+  cheap, and it prevents a supplier's documents from being silently missed
+  because they fell outside a small unfiltered candidate window.
+- When no filter is active, each engine returns
+  `min(max(top_k × 4, top_k), document_count)` candidates. `4` is a documented
+  default, not a tuned value.
+- An invalid filter value raises `RetrievalQueryError`. A valid filter that
+  matches no document returns an empty result.
+
+### 9.9 Artifacts, persistence, and reload validation
+
+Artifact directory: `artifacts/retrieval/` (Git-ignored).
+
+| Artifact | Path | Contents |
+|---|---|---|
+| Corpus | `artifacts/retrieval/corpus.json` | Source dataset version and seed, document count, SHA-256 corpus fingerprint, every document |
+| FAISS index | `artifacts/retrieval/dense.index.faiss` | `IndexFlatIP`, one normalized vector per document |
+| Dense metadata | `artifacts/retrieval/dense.metadata.json` | Embedding model, dimension, metric, fingerprint, vector id → document map |
+| Lexical index | `artifacts/retrieval/lexical.json` | Tokenizer version, BM25 parameters, document ids, token lists |
+| Manifest | `artifacts/retrieval/manifest.json` | Written last; artifact version, corpus schema version and fingerprint, document/contract/complaint counts, embedding model and dimension, index type, metric, tokenizer version, BM25 parameters |
+
+`artifacts/` and `*.faiss` are already Git-ignored. All metadata is JSON; no
+pickle is read or written.
+
+Reload validation, in order:
+
+1. The manifest exists and validates.
+2. The corpus validates, its fingerprint matches its documents, and it matches
+   the manifest fingerprint, schema version, document count, and source counts.
+3. `index.d` equals the metadata and manifest dimension, `index.ntotal` equals
+   the document count, the index type is `IndexFlatIP`, vector ids equal their
+   positions, and document ids are unique.
+4. The dense metadata matches the manifest fingerprint, embedding model,
+   dimension, and document count, and its `document_id`, `supplier_id`,
+   `partition`, and `source_type` fields match the corpus document at the same
+   position.
+5. The lexical tokenizer version, BM25 parameters, fingerprint, and document
+   order match the manifest and corpus, and every persisted token list equals
+   the tokens the current tokenizer produces from that document's corpus text.
+6. An injected query embedder declares the persisted embedding model; when it
+   also exposes a cheap `declared_dimension`, that must equal the persisted
+   dimension. Lazy embedders keep the query-time vector dimension check.
+
+The default retriever is cached per artifact path, so a process that rebuilds
+artifacts must call `reset_default_retriever()` or restart before querying.
+
+Writes go through a temporary sibling file and `os.replace`, so a single file is
+never partially written. Replacing the whole artifact set is **not** one
+transaction: a crash between files can leave a mixed set. Because the manifest
+is written last and records the corpus fingerprint, model, dimension, and
+counts, such a set fails validation instead of being served.
+
+### 9.10 Building and querying
+
+```bash
+uv run --locked python -m supplier_risk.retrieval.build
+uv run --locked python -m supplier_risk.retrieval.build --artifacts-dir /tmp/retrieval
+```
+
+The build re-validates `data/generated/suppliers.json`, builds the corpus, both
+indexes, and the manifest, and prints document, index, and fingerprint counts.
+A missing or invalid dataset raises `CorpusError` with the generator command to
+run; it is never replaced with an empty corpus.
+
+Query interface and the assignment-facing wrapper:
+
+```python
+from supplier_risk.retrieval import HybridRetriever, query_faiss
+
+retriever = HybridRetriever.load("artifacts/retrieval")
+hits = retriever.query(
+    "quality inspection records", top_k=5, supplier_id="SUP-001", partition="train"
+)
+context = query_faiss("SUP-001", retriever=retriever)
+```
+
+`query_faiss(entity)` accepts a supplier id or an exact legal name
+(case-insensitive), applies an exact `supplier_id` filter, and returns one
+labeled `[FAISS]` context string with the supplier identity, partition,
+document count, and per-document source identity, ranks, and text. Unknown
+suppliers and unavailable or corrupt artifacts are returned as tagged
+`[FAISS ERROR]` strings. The string covers contract and complaint documents
+only and never implies that SQLite or Neo4j was queried. The generic
+`HybridRetriever.query` API raises typed project errors instead.
+
+Error types: `CorpusError` (build input), `EmbeddingModelError` (local model
+load or invalid vectors), `RetrievalArtifactError` (missing, stale, or corrupt
+artifacts), `RetrievalQueryError` (query, `top_k`, or filter values), and
+`UnknownSupplierError` (supplier wrapper resolution).
+
+### 9.11 Deliberate non-claims
+
+Module 3 does **not** populate SQLite, create Neo4j nodes or edges, run the three
+engines in parallel, evaluate retrieval quality, or implement DSPy, the judge,
+scoring, or the UI. `query_faiss` is one document-retrieval function, not a
+multi-engine query.
 
 ## 10. Proposed Neo4j graph schema
 
@@ -608,7 +760,7 @@ approval needed before expanding the model.
 | Store | Location of supplier identity |
 |---|---|
 | SQLite | `suppliers.supplier_id` primary key; foreign keys from `delivery_metrics`, `contracts`, `complaints`, `ownership_links` |
-| FAISS metadata | `supplier_id` on every chunk, alongside `source_type` and `source_id` |
+| Document retrieval | `supplier_id` on every document in `corpus.json` and on every vector entry in `dense.metadata.json`, alongside `source_type` and `source_id`; the BM25 payload uses the same document order |
 | Neo4j | `Supplier.supplier_id` unique key, targeted by typed ownership edges |
 
 Partition membership is not a separate lookup table. It is decided once by
@@ -619,7 +771,7 @@ then copied unchanged by each store:
 |---|---|---|
 | Generated JSON | `SupplierRecord.partition` | Validated against the fixed mapping |
 | SQLite | `suppliers.partition` column | Copied from the validated record |
-| FAISS metadata | `partition` field on every chunk | Copied from the chunk's supplier record |
+| Document retrieval | `partition` on every document and every vector entry; BM25 positions align with the same document order | Copied from the validated supplier record |
 | Neo4j | `Supplier.partition` property | Copied from the validated record |
 
 Consumers should read the stored partition and may assert it equals
@@ -634,9 +786,10 @@ their supplier's partition and cannot move independently.
 | Supplier/contract/complaint/ownership fields | Domain-mandated categories | Implemented and validated | Must map these contracts |
 | 24 suppliers, 14/4/6 split | Only ~20–30 and a held-out entity are mandated | Implemented; provisional counts | — |
 | Fixed id-to-partition mapping | Not specified | Implemented and enforced | Must preserve it |
-| SQLite tables | Store population mandated | Not implemented; schema proposed in section 8 | Module 3 |
-| FAISS chunks, embeddings, index | Store population mandated | Not implemented; design proposed in section 9 | Module 3 |
-| Neo4j nodes and edges | Store population mandated | Not implemented; design proposed in section 10 | Module 4 |
+| SQLite tables | Store population mandated | Not implemented; schema proposed in section 8 | Later module |
+| FAISS documents, embeddings, index | Store population mandated | Implemented in Module 3 (section 9) | Complete for contracts and complaints |
+| BM25 lexical index and RRF hybrid retrieval | Hybrid BM25+dense required | Implemented in Module 3 (section 9) | Complete |
+| Neo4j nodes and edges | Store population mandated | Not implemented; design proposed in section 10 | Later module |
 | Multi-parent / nested ownership | Unspecified | Not supported | Open decision |
 
 ## 12. Validation errors
@@ -655,6 +808,27 @@ list more than 20 individual problems (for example, every duplicate supplier id
 in a malformed payload). There is no enforced 20-issue cap on that aggregated
 message. The output remains input-free.
 
+### 12.1 Retrieval errors (Module 3)
+
+The retrieval stack raises typed project errors; it does not return empty results
+for infrastructure failures. Messages never include credentials, rejected input
+values, or full record dumps.
+
+| Error | Raised for |
+|---|---|
+| `CorpusError` | Empty corpus, duplicate document or source id, unknown source record, source/supplier mismatch, invalid tokenizer or BM25 configuration, missing dataset input |
+| `EmbeddingModelError` | Model cannot be loaded, inference fails, or embeddings are mis-shaped, non-finite, or zero-length |
+| `RetrievalArtifactError` | Missing manifest, corpus, dense index, dense metadata, or lexical payload; unreadable or corrupt files; fingerprint, dimension, count, model, tokenizer, or ordering mismatch |
+| `RetrievalQueryError` | Blank query, query with no searchable tokens, invalid `top_k`, invalid RRF `k`, invalid `supplier_id` or `partition` filter |
+| `UnknownSupplierError` | A supplier wrapper entity that matches no supplier id or exact legal name |
+
+`query_faiss(entity)` is the only layer that converts known infrastructure
+errors (`RetrievalArtifactError`, `EmbeddingModelError`) and
+`UnknownSupplierError` into tagged `[FAISS ERROR]` context strings, matching the
+engine-level error contract in Guide Step 3. The generic
+`HybridRetriever.query` API raises typed errors instead. No broad catch-all
+handler is installed, so programming errors still surface.
+
 ## 13. Open decisions and limitations
 
 ### Open decisions requiring approval
@@ -667,16 +841,22 @@ message. The output remains input-free.
 2. **Parent-company normalization in SQLite.** Keep repeated parent id/name
    columns in `ownership_links`, or introduce a `parent_companies` table. The
    current proposal keeps the flat representation to avoid implying a hierarchy.
-3. **Embedding model.** `all-MiniLM-L6-v2` is provisional; no model has been
-   selected in code.
-4. **FAISS index type and artifact format.** `IndexFlatIP` plus JSONL metadata
-   is proposed, not implemented. Confirm before Module 3.
-5. **Chunking fallback.** One chunk per record is proposed for the current short
-   texts; the >512-token split policy is not implemented.
-6. **Schema/artifact migration.** `schema_version` is the only version marker
-   for the JSON dataset; separate index/artifact versioning remains to be
-   defined.
-7. **Partition counts.** 14/4/6 remains provisional even though it is enforced.
+3. **Embedding model.** `all-MiniLM-L6-v2` (384 dimensions, CPU) is implemented
+   and recorded in `manifest.json`. It remains a provisional model choice;
+   changing it requires rebuilding every artifact.
+4. **Dense index type.** `IndexFlatIP` over normalized vectors with JSON
+   metadata is implemented. An approximate index is unnecessary at 66 documents
+   and is only worth revisiting if the corpus grows substantially.
+5. **Chunking fallback.** One document per source record is implemented and
+   documented. No >512-token split policy exists; revisit if contract or
+   complaint text grows beyond the model input window.
+6. **Artifact migration.** `module3.v1` and `manifest.json` now version the
+   retrieval artifacts and record the corpus fingerprint, embedding model,
+   dimension, tokenizer version, and BM25 parameters. A schema or model change
+   still requires rebuilding all artifacts together.
+7. **Candidate window and fusion tuning.** The `4 × top_k` unfiltered candidate
+   multiplier and `RRF k = 60` are documented defaults, not tuned values.
+8. **Partition counts.** 14/4/6 remains provisional even though it is enforced.
 
 ### Limitations and assumptions
 
@@ -690,10 +870,21 @@ message. The output remains input-free.
 - Ownership is a single optional parent link per supplier; deeper corporate
   structures are unsupported and must not be inferred from the code.
 - Empty complaints mean "no synthetic complaint record", not "no risk".
-- Module 2 does not populate SQLite, FAISS, or Neo4j, and does not implement
+- Modules 2–3 do not populate SQLite or Neo4j and do not implement parallel
   retrieval, risk scoring, DSPy, the judge, or the UI.
+- Retrieval is exact FAISS search over 66 documents; recall, ranking quality, and
+  latency at larger corpus sizes are unmeasured.
+- The embedding model, the `4 × top_k` candidate window, and `RRF k = 60` are
+  defaults, not tuned values. Hybrid ranking has not been evaluated against
+  relevance labels.
+- A build replaces its artifact files one at a time: each file is atomic, but the
+  set is not. The manifest fingerprint and compatibility checks detect a mixed
+  set at load time instead of serving it.
 - `SCHEMA_VERSION` in `contracts.py` is the runtime source for
   `schema_version`; the `SchemaVersion` literal alias is checked by a test. Any
   field, range, identifier, or partition change requires a schema-version
   change, documentation update, and test update, and makes existing generated
-  artifacts incompatible until regenerated.
+  artifacts incompatible until regenerated. `ARTIFACT_VERSION` (`module3.v1`)
+  plays the same role for retrieval artifacts: any change to document identity,
+  text construction, metadata fields, artifact layout, or index configuration
+  requires a version bump and a rebuild.

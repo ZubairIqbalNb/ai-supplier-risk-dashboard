@@ -5,8 +5,13 @@ description = "AI Supplier Risk Dashboard: parallel multi-source retrieval with 
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "faiss-cpu>=1.9,<2",
+    "numpy>=1.26,<3",
     "pydantic>=2.11,<3",
     "python-dotenv>=1.0,<2",
+    "rank-bm25>=0.2.2,<0.3",
+    "sentence-transformers>=3,<6",
+    "torch>=2.4,<3",
 ]
 
 [dependency-groups]
@@ -15,6 +20,16 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
 ]
+
+# Dense retrieval runs on CPU only. Pinning torch to the PyTorch CPU wheel
+# index keeps CUDA/nvidia packages out of the lockfile and the environment.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
 
 [build-system]
 requires = ["hatchling"]
@@ -25,7 +40,13 @@ packages = ["src/supplier_risk"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Shared test doubles live in `tests/support.py`; the project root must be
+# importable for `tests.support` to resolve under any pytest import mode.
+pythonpath = ["."]
 addopts = "-ra"
+markers = [
+    "real_model: downloads and runs the local sentence-transformer model; opt in with SUPPLIER_RISK_REAL_MODEL_TESTS=1",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -37,3 +58,8 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 check_untyped_defs = true
 no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+# rank_bm25 ships no type information and no py.typed marker.
+module = ["rank_bm25"]
+ignore_missing_imports = true

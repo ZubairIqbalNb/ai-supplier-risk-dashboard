@@ -65,14 +65,19 @@ These decisions are engineering choices, not verified assignment requirements:
 - SQLite column names and synthetic metric distributions.
 - Neo4j ownership schema (Module 2 implements one optional parent link per
   supplier) and a future 3-hop traversal limit.
-- Real BM25 + FAISS dense retrieval + reciprocal rank fusion.
+- Real BM25 + FAISS dense retrieval + reciprocal rank fusion. Implemented in
+  Module 3 (`src/supplier_risk/retrieval/`).
 - Pydantic v2 contracts. Implemented in Module 2 (`src/supplier_risk/contracts.py`).
 - Streamlit as the UI framework.
 - 0–100 risk score, `evidence_status`, citation schema, summary length, and
   banned-word list.
 - Evidence-status behavior for missing or failed retrieval.
 - Timeout values and retry policy.
-- `all-MiniLM-L6-v2` as the embedding model.
+- `all-MiniLM-L6-v2` (384 dimensions, CPU) as the embedding model. Implemented
+  in Module 3 and recorded in `artifacts/retrieval/manifest.json`.
+- One document per contract/complaint record, `IndexFlatIP` cosine search,
+  BM25 `k1=1.5`/`b=0.75`, tokenizer `module3.v1`, `RRF k = 60`, and the
+  `artifacts/retrieval/` artifact layout. Implemented in Module 3.
 - Local-first Docker Neo4j.
 
 ## Resolved conflicts
@@ -126,3 +131,59 @@ Evidence:
 Module 2 does not add retrieval, graph persistence, DSPy, Gemini calls, scoring,
 evaluation, or UI behavior. The provisional fields (0–100 score, evidence
 status, citations) remain unimplemented.
+
+## Module 3 status
+
+Module 3 implements the document half of the semantic store: a deterministic
+corpus of contract and complaint documents, a persisted FAISS dense index, a
+persisted BM25 lexical index, hybrid ranking with RRF, metadata filtering, and
+the assignment-facing `query_faiss(entity)` wrapper. SQLite population, Neo4j,
+parallel orchestration, DSPy, the judge, and the UI remain unimplemented.
+
+Evidence:
+
+- **R-09 (implemented):** `reciprocal_rank_fusion()` in
+  `src/supplier_risk/retrieval/rrf.py` merges real BM25 and dense rankings with
+  `RRF(d) = Σ 1 / (k + rank_i(d))`, one-based ranks, `k = 60`, duplicate-summing,
+  deterministic tie-breaking, and `top_k`. Hand-calculated formula tests are in
+  `tests/test_retrieval_fusion.py`.
+- **R-07 (partially implemented):** contracts and complaints are chunked as one
+  document per record, embedded locally with `all-MiniLM-L6-v2`, and persisted
+  as `dense.index.faiss` plus JSON metadata under `artifacts/retrieval/`. The build
+  prints document, index, and fingerprint counts. SQLite tables and Neo4j nodes
+  and edges remain unimplemented.
+- **R-08 (partially implemented):** `query_faiss(entity)` in
+  `src/supplier_risk/retrieval/pipeline.py` accepts a supplier id or exact legal
+  name and returns a labeled `[FAISS]` context string covering only contract and
+  complaint documents, with a tagged `[FAISS ERROR]` string for unknown
+  suppliers and unavailable artifacts. `query_sql` and `query_graph` do not
+  exist yet.
+- **R-04 (partially implemented):** hybrid search, BM25, and RRF are
+  implemented; text-to-SQL, Neo4j GraphRAG, DSPy, parallel retrieval, and
+  LLM-as-judge are not.
+- **R-02 / R-11 / R-12 (not implemented):** retrieval is single-engine and
+  synchronous. There is no ThreadPoolExecutor, no three-engine orchestration,
+  and no latency comparison.
+- **R-27 (not demonstrated):** the FAISS wrapper returns only document text. The
+  cross-engine diversity check requires SQL and graph contexts that do not exist
+  yet.
+- **R-30 (partial gate):** the FAISS/BM25 engine passes its own smoke tests
+  (offline suite plus opt-in real-model tests). DSPy synthesis must still wait
+  for the SQL and graph engines.
+- **R-05 (partially satisfied):** the generator plus the Module 3 build populate
+  the semantic store; no store population exists for SQLite or Neo4j.
+- **Artifact integrity:** loading validates the manifest, corpus fingerprint,
+  counts, index dimension/type/vector count, vector-to-document mapping, the
+  duplicated dense identity fields, embedding model, tokenizer version, BM25
+  parameters, and persisted token lists against the canonical corpus text; an
+  injected query embedder must also declare the persisted model (and dimension
+  where it is cheap to report). Missing or corrupt artifacts raise
+  `RetrievalArtifactError`. Tests are in `tests/test_retrieval_dense.py`,
+  `tests/test_retrieval_lexical.py`, `tests/test_retrieval_embeddings.py`, and
+  `tests/test_retrieval_pipeline.py`.
+- **R-26 (extended):** `docs/schema.md` section 9 now documents the implemented
+  retrieval artifacts and labels the still-proposed SQLite and Neo4j schemas as
+  unimplemented.
+
+Module 3 adds no SQLite, Neo4j, DSPy, Gemini, scoring, evaluation, or UI code.
+It reads no environment variables and makes no external LLM calls.
