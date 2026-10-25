@@ -1,4 +1,4 @@
-.PHONY: install lock index graph-ingest neo4j-up neo4j-down test test-graph test-real-model lint typecheck check
+.PHONY: install lock index graph-ingest sql-build neo4j-up neo4j-down test test-graph test-real-model lint typecheck check
 
 install:
 	uv sync --locked --group dev
@@ -17,6 +17,9 @@ neo4j-down:
 
 graph-ingest:
 	uv run --locked python -m supplier_risk.graph.ingest
+
+sql-build:
+	uv run --locked python -m supplier_risk.sql.build
 
 test:
 	uv run --locked pytest -q

@@ -1,10 +1,10 @@
-# Supplier Data Schema (Modules 2–4)
+# Supplier Data Schema (Modules 2–5)
 
 **Project:** AI Supplier Risk Dashboard  
 **Phase:** Phase 2 — Multi-Source Retrieval  
-**Versions:** `module2.v1` (source dataset), `module3.v1` (retrieval artifacts), Neo4j graph schema from Module 4
+**Versions:** `module2.v1` (source dataset), `module3.v1` (retrieval artifacts), `module5.v1` (SQLite store), Neo4j graph schema from Module 4
 
-**Status:** Module 2 data foundation, Module 3 document retrieval, and Module 4 ownership graph implemented
+**Status:** Module 2 data foundation, Module 3 document retrieval, Module 4 ownership graph, and Module 5 SQL retrieval plus parallel orchestration implemented
 
 This note defines the canonical raw supplier data used by later modules, the
 document-retrieval artifacts built from it, and the Neo4j ownership graph.
@@ -12,8 +12,9 @@ Module 2 generates and validates the source records. Module 3 builds a
 deterministic document corpus, a persisted FAISS dense index, and a persisted
 BM25 lexical index, and serves hybrid retrieval with Reciprocal Rank Fusion.
 Module 4 validates the ownership records and writes the supplier/company graph
-to Neo4j, with bounded `query_graph(entity)` retrieval. SQLite is still **not**
-populated, and no scoring, DSPy synthesis, or UI exists.
+to Neo4j, with bounded `query_graph(entity)` retrieval. Module 5 adds the SQLite
+delivery/defect store, `query_sql(entity)`, and parallel three-source
+orchestration. No scoring, DSPy synthesis, judge, or UI exists.
 
 **Status legend**
 
@@ -78,9 +79,11 @@ These are project choices, not assignment-mandated values:
 `SupplierRecord` and `SupplierDataset` are the source-of-truth containers used
 to generate all three stores consistently. Sections 3–7 add field-level
 validation detail; the table above is the single-page summary. Section 8
-records the **proposed** SQLite schema, which remains unimplemented. Section 9
-documents the **implemented** Module 3 document-retrieval artifacts, and
-section 10 the **implemented** Module 4 Neo4j graph.
+records the **implemented** Module 5 SQLite schema and the tables deliberately
+not duplicated there. Section 9 documents the **implemented** Module 3
+document-retrieval artifacts, section 10 the **implemented** Module 4 Neo4j
+graph, and section 11 the **implemented** Module 5 SQL retrieval and parallel
+orchestration.
 
 ## 3. Canonical records
 
@@ -183,7 +186,7 @@ supplier has a known parent.
 The model does not represent multiple parents, parent-of-parent chains, or a
 company hierarchy. The assignment names a “subsidiary/ownership graph” but does
 not specify graph depth or ownership cardinality. Module 4 implements this
-one-parent model faithfully; see section 13 for the expansion decision.
+one-parent model faithfully; see section 14 for the expansion decision.
 
 ### 3.6 `SupplierRecord`
 
@@ -350,10 +353,13 @@ Leakage controls:
 - Shared parent companies across partitions are allowed because the ownership
   graph is a legitimate relationship, not a second copy of a supplier record.
 
-## 8. Proposed SQLite schema
+## 8. SQLite schema (Module 5: implemented subset)
 
-**Status:** Proposed. No database is created in Module 2. This design maps the
-implemented Pydantic models; it does not add derived risk fields.
+**Status:** Implemented for `dataset_metadata`, `suppliers`, and
+`delivery_metrics` in `src/supplier_risk/sql/`. Subsections 8.4–8.6 record the
+proposed contract, complaint, and ownership tables; Module 5 does **not**
+create them, because that evidence already belongs to Module 3 and Module 4.
+The design maps the implemented Pydantic models and adds no derived risk field.
 
 Loading assumptions: run inside one transaction, enable
 `PRAGMA foreign_keys = ON` for every connection, insert suppliers before child
@@ -459,6 +465,13 @@ Repeated `(ORG-NNN, name)` rows are acceptable because the dataset validator
 guarantees id-to-name consistency; normalization is an open decision in section
 13. A separate table would also let SQLite express parent/child company
 hierarchies that the current contract does not support.
+
+**Not created in Module 5.** Contract and complaint text lives in the Module 3
+retrieval artifacts, and ownership links live in the Module 4 Neo4j graph.
+Duplicating them in SQLite would create a second, independently editable copy of
+evidence another engine already owns. The Module 5 store therefore contains
+`dataset_metadata`, `suppliers`, and `delivery_metrics` only; a build validates
+those three tables and `query_sql` reads nothing else.
 
 ## 9. Implemented document retrieval (Module 3)
 
@@ -842,7 +855,124 @@ percentages, or supplier-to-supplier ownership edges. The query is bounded to
 3 hops, but a deeper hierarchy is not supported by the current contract or
 ingestion. Section 13 records the approval needed before expanding the model.
 
-## 11. Shared identity and partition propagation
+## 11. Implemented SQL retrieval and parallel orchestration (Module 5)
+
+**Status:** Implemented. Module 5 adds the SQLite structured store, the
+assignment-facing `query_sql(entity)` wrapper, and `query_all_sources(entity)`,
+which runs the SQL, FAISS/BM25, and Neo4j sources concurrently.
+
+### 11.1 SQLite store
+
+`supplier_risk.sql.build` writes `data/generated/suppliers.sqlite` (Git-ignored)
+from the same validated dataset. The database contains `dataset_metadata`,
+`suppliers`, and `delivery_metrics`; contracts, complaints, and ownership edges
+are **not** duplicated here. `dataset_metadata.schema_version` is `module5.v1`,
+and `seed` plus `supplier_count` identify the snapshot.
+
+```bash
+uv run --locked python -m supplier_risk.sql.build   # or: make sql-build
+```
+
+A build validates the load plan, inserts every row in one transaction, verifies
+the row counts before committing, and replaces the file atomically. There is no
+incremental update: rebuilding is the supported way to refresh the store, and a
+query never creates or modifies it. A stale database is not detected at query
+time; rebuild it after regenerating the dataset, exactly as the Module 3
+artifacts are rebuilt.
+
+### 11.2 `query_sql(entity)`
+
+`query_sql` accepts a supplier id (`SUP-007`, case-insensitive) or an exact
+legal name (case-insensitive) and returns one labeled context string:
+
+```text
+[SQL] supplier=SUP-001 name=Norvend Components Ltd partition=train
+scope=delivery+defect-metrics source=sqlite table=delivery_metrics
+delivery_metrics=1
+1. period=FY2025 on_time_delivery_rate=0.809 defect_rate=0.0291 average_lead_time_days=13.4 orders_fulfilled=3970
+```
+
+Each query opens one short-lived read-only connection in the calling thread and
+closes it before returning, so concurrent queries never share a connection. A
+known supplier with no stored observation returns `delivery_metrics=0`, which is
+no evidence, not an error. Unknown suppliers, a missing or corrupt database, and
+integrity failures return tagged `[SQL ERROR]` strings.
+
+### 11.3 Parallel orchestration
+
+`query_all_sources(entity)` submits `query_sql`, `query_faiss`, and
+`query_graph` to a `ThreadPoolExecutor` before waiting for any of them, then
+collects each outcome independently. The default capacity is three workers. The
+result holds one `SourceEvidence` per source in fixed `SQL`, `FAISS`, `GRAPH`
+order, regardless of completion order:
+
+| Field | Meaning |
+|---|---|
+| `entity` | The entity exactly as requested; each source resolves it and this layer never rewrites it |
+| `sources` | Three `SourceEvidence` entries in `SQL`, `FAISS`, `GRAPH` order |
+| `source(name)`, `.sql`, `.faiss`, `.graph` | One source's evidence |
+| `SourceEvidence.context` | The source's complete labeled text, including its tagged error string on failure |
+| `SourceEvidence.status` | `ok`, `empty` (successful query, no evidence), or `error` |
+| `SourceEvidence.error` | The tagged error string when the source failed, otherwise `None` |
+| `SourceEvidence.elapsed_seconds` | Time spent inside that source call |
+| `elapsed_seconds` | Total orchestration wall-clock time |
+| `outcome` | `complete`, `partial`, or `failed` |
+| `context()` | All three labeled sections joined in canonical order |
+
+`complete` means no source failed; empty evidence still counts as complete.
+`partial` means at least one source succeeded and at least one failed. `failed`
+means all three failed and is the explicit total-retrieval-failure result. A
+failed source keeps its tag in the combined context, so provenance is never lost
+and no evidence is fabricated for it.
+
+Each source keeps its own failure contract: `[SQL ERROR]`, `[FAISS ERROR]`, and
+`[GRAPH ERROR]` strings are classified as errors, and a successful context that
+contains the source's documented no-evidence marker is classified as empty.
+Unexpected exceptions from an injected callable are isolated to that source and
+reported as `[<SOURCE> ERROR] <ExceptionType>: <message>` after redacting
+credential-like values (URI userinfo and `PASSWORD` / `SECRET` / `TOKEN` /
+`API_KEY` assignments).
+
+`timeout_seconds` bounds how long the orchestrator waits; it does not terminate a
+source call that is already running. A timed-out future is abandoned and tagged
+`retrieval timed out after N s; the source call was abandoned, not terminated`.
+Without an explicit timeout the orchestrator waits for all three sources.
+
+Thread safety: SQLite uses a connection per query, the FAISS and BM25 indexes are
+only read, and Neo4j opens its own store per query. The Module 3 default
+retriever and its embedding model load lazily, so the first concurrent FAISS
+query may load the model more than once; that is wasteful but does not corrupt
+results. The orchestrator never changes logging or environment configuration
+from a worker thread.
+
+```python
+from supplier_risk.orchestration import query_all_sources
+
+result = query_all_sources("SUP-007")
+print(result.outcome, result.failed_sources)
+print(result.sql.context)
+print(result.faiss.context)
+print(result.graph.context)
+```
+
+Module 5 does not score, judge, or decide anything: there is no risk score,
+confidence value, `evidence_status`, or `APPROVE` / `FLAG` verdict.
+
+### 11.4 Tests
+
+```bash
+uv run --locked pytest -q tests/test_sql_schema.py tests/test_sql_pipeline.py \
+    tests/test_orchestration.py tests/test_orchestration_integration.py
+SUPPLIER_RISK_NEO4J_TESTS=1 uv run --locked pytest -q -m neo4j
+```
+
+The orchestration unit tests inject source callables and use
+`threading.Barrier` to prove concurrent submission. The offline integration
+tests exercise the real `query_sql` and `query_faiss` implementations plus a
+store double for the graph wrapper. The live Neo4j test is opt-in and runs the
+real graph source next to the real SQL and FAISS sources.
+
+## 12. Shared identity and partition propagation
 
 `supplier_id` is the **canonical identifier** linking all three stores:
 
@@ -875,13 +1005,14 @@ their supplier's partition and cannot move independently.
 | Supplier/contract/complaint/ownership fields | Domain-mandated categories | Implemented and validated | Must map these contracts |
 | 24 suppliers, 14/4/6 split | Only ~20–30 and a held-out entity are mandated | Implemented; provisional counts | — |
 | Fixed id-to-partition mapping | Not specified | Implemented and enforced | Must preserve it |
-| SQLite tables | Store population mandated | Not implemented; schema proposed in section 8 | Later module |
+| SQLite tables | Store population mandated | Implemented in Module 5 (sections 8 and 11): suppliers plus delivery metrics | Contracts, complaints, and ownership links stay in their owning stores |
+| Parallel three-source retrieval | Parallel retrieval mandated | Implemented in Module 5 (section 11.3) | DSPy synthesis and the verdict remain later modules |
 | FAISS documents, embeddings, index | Store population mandated | Implemented in Module 3 (section 9) | Complete for contracts and complaints |
 | BM25 lexical index and RRF hybrid retrieval | Hybrid BM25+dense required | Implemented in Module 3 (section 9) | Complete |
 | Neo4j nodes and edges | Store population mandated | Implemented in Module 4 (section 10) | Complete for the canonical ownership graph |
 | Multi-parent / nested ownership | Unspecified | Not supported | Open decision |
 
-## 12. Validation errors
+## 13. Validation errors
 
 `parse_dataset_payload()` and `parse_dataset_json()` raise
 `DatasetValidationError` with:
@@ -897,7 +1028,7 @@ list more than 20 individual problems (for example, every duplicate supplier id
 in a malformed payload). There is no enforced 20-issue cap on that aggregated
 message. The output remains input-free.
 
-### 12.1 Retrieval errors (Module 3)
+### 13.1 Retrieval errors (Module 3)
 
 The retrieval stack raises typed project errors; it does not return empty results
 for infrastructure failures. Messages never include credentials, rejected input
@@ -918,7 +1049,23 @@ engine-level error contract in Guide Step 3. The generic
 `HybridRetriever.query` API raises typed errors instead. No broad catch-all
 handler is installed, so programming errors still surface.
 
-## 13. Open decisions and limitations
+### 13.2 SQL and orchestration errors (Module 5)
+
+| Error | Raised for |
+|---|---|
+| `SqlConfigError` | Invalid SQLite store configuration, such as a non-positive busy timeout or a destination that is not a regular file |
+| `SqlStoreUnavailableError` | Missing, uncreatable, or unreadable database file |
+| `SqlQueryError` | SQLite rejected a statement or the file is not a usable database |
+| `SqlDataIntegrityError` | Invalid load plan, malformed stored row, conflicting duplicate period, or post-load row-count mismatch |
+| `UnknownSqlEntityError` | A supplier identity that matches no row or more than one row |
+| `OrchestrationError` | Invalid `max_workers`, invalid `timeout_seconds`, or a missing source callable |
+
+`query_sql` converts `SqlError` subclasses into tagged `[SQL ERROR]` strings and
+lets unexpected programming errors propagate. `query_all_sources` never raises
+a source failure: it isolates it, tags it with the source label, and continues
+collecting the other sources.
+
+## 14. Open decisions and limitations
 
 ### Open decisions requiring approval
 
@@ -960,9 +1107,14 @@ handler is installed, so programming errors still surface.
 - Ownership is a single optional parent link per supplier; deeper corporate
   structures are unsupported and must not be inferred from the code.
 - Empty complaints mean "no synthetic complaint record", not "no risk".
-- Module 4 populates Neo4j with the canonical ownership graph. SQLite remains
-  unpopulated, and parallel retrieval, risk scoring, DSPy, the judge, and the UI
-  are not implemented.
+- Modules 3–5 populate the document, graph, and SQLite stores and expose
+  parallel retrieval. Risk scoring, DSPy synthesis, the judge, and the UI are
+  not implemented.
+- The SQLite store is a snapshot of one dataset build. Nothing detects a store
+  built from a different seed at query time; rebuild it after regenerating the
+  dataset, as with the Module 3 artifacts.
+- Orchestrator timeouts bound waiting, not execution: an abandoned source call
+  may keep running in its worker thread until it returns on its own.
 - Retrieval is exact FAISS search over 66 documents; recall, ranking quality, and
   latency at larger corpus sizes are unmeasured.
 - The embedding model, the `4 × top_k` candidate window, and `RRF k = 60` are

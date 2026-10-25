@@ -62,7 +62,10 @@ These decisions are engineering choices, not verified assignment requirements:
 - 24 suppliers and a 14 train / 4 development / 6 held-out split. Implemented
   in Module 2, but still a provisional engineering choice; the assignment only
   requires approximately 20–30 entities and a held-out entity outside training.
-- SQLite column names and synthetic metric distributions.
+- SQLite column names and synthetic metric distributions. The Module 5 store
+  implements only `dataset_metadata`, `suppliers`, and `delivery_metrics`; the
+  proposed contract, complaint, and ownership tables remain unbuilt because
+  Modules 3 and 4 already own that evidence.
 - Neo4j ownership schema (one optional parent link per supplier), the
   `Supplier`/`Company` labels, and the 3-hop / 25-relationship query limits.
   Implemented in Module 4 (`src/supplier_risk/graph/`).
@@ -93,8 +96,8 @@ These decisions are engineering choices, not verified assignment requirements:
 ## Unresolved ambiguity
 
 - **Text-to-SQL:** The topic list names it, but the concrete deliverable is
-  `query_sql(entity)`. Module 1 and the MVP use parameterized SQL only. A
-  constrained NL-to-SQL layer would require clarification and a separate module.
+  `query_sql(entity)`. Modules 1–5 use parameterized SQL only. A constrained
+  NL-to-SQL layer would require clarification and a separate module.
 
 ## Module 1 status
 
@@ -239,3 +242,61 @@ Evidence:
 Module 4 adds no SQLite, DSPy, Gemini, scoring, evaluation, or UI code. It reads
 only the three `NEO4J_*` settings, makes no external LLM calls, and never
 returns a legal-control or risk verdict from ownership data alone.
+
+## Module 5 status
+
+Module 5 implements the structured SQL source and the parallel orchestration
+layer: a SQLite delivery/defect store, the assignment-facing `query_sql(entity)`
+wrapper, and `query_all_sources(entity)`, which runs the SQL, FAISS/BM25, and
+Neo4j sources concurrently with per-source error isolation. DSPy synthesis, the
+judge, scoring, and the UI remain unimplemented.
+
+Evidence:
+
+- **R-08 (implemented):** `query_sql` (`src/supplier_risk/sql/pipeline.py`),
+  `query_faiss` (Module 3), and `query_graph` (Module 4) all accept a supplier id
+  or exact legal name and return one labeled context string, with tagged
+  `[SQL ERROR]` / `[FAISS ERROR]` / `[GRAPH ERROR]` strings for failures. Tests:
+  `tests/test_sql_pipeline.py`, plus the existing Module 3 and 4 suites.
+- **R-07 (implemented for the canonical stores):**
+  `uv run --locked python -m supplier_risk.sql.build` (or `make sql-build`)
+  loads the validated dataset, writes 24 `suppliers` rows and 24
+  `delivery_metrics` rows in one transaction, verifies the row counts, and
+  replaces `data/generated/suppliers.sqlite` atomically. The store deliberately
+  does not duplicate contract/complaint text or ownership edges. Tests:
+  `tests/test_sql_schema.py`.
+- **R-02 / R-11 (implemented):** `query_all_sources(entity)` submits all three
+  sources to a `ThreadPoolExecutor` before waiting, collects each outcome
+  independently, and returns a provenance-preserving
+  `OrchestrationResult`. A `threading.Barrier` test proves concurrent
+  submission; single- and multi-source failure tests prove the surviving
+  evidence is preserved. Tests: `tests/test_orchestration.py`.
+- **R-10 (implemented):** every engine tags its own failures instead of
+  crashing, and the orchestrator isolates unexpected exceptions per source and
+  redacts credential-like values. Empty evidence is reported as `empty`, not as
+  an error.
+- **R-12 (implemented; no production latency claim):** the orchestrator reports
+  per-source and overall elapsed time, and a test shows three 0.15 s sources
+  complete well under the 0.45 s a sequential implementation would need. No
+  benchmark at larger scale is claimed.
+- **R-28 (implemented):** a failed graph source alongside successful SQL and
+  FAISS sources returns a `partial` result carrying the tagged graph error plus
+  the two evidence contexts.
+- **R-27 (demonstrated):** the offline integration test asserts that the SQL,
+  FAISS, and graph contexts for the same supplier contain different facts, and
+  that no source claims another's evidence.
+- **R-30 (gate satisfied for retrieval):** all three engines pass their own
+  offline smoke tests, and `tests/test_orchestration_integration.py` runs the
+  real SQL and FAISS/BM25 engines together. The live Neo4j variant is opt-in.
+  DSPy synthesis may begin in Module 6.
+- **R-04 (partially implemented):** hybrid search, BM25, RRF, Neo4j graph
+  retrieval, and parallel retrieval are implemented. Text-to-SQL remains
+  parameterized SQL only; DSPy prompting and the judge are not implemented.
+- **R-26 (extended):** `docs/schema.md` section 8 documents the implemented
+  SQLite subset and section 11 the SQL context, orchestration contract, partial
+  failure behavior, concurrency, and timeouts. Sections 11–13 were renumbered to
+  12–14.
+
+Module 5 adds no DSPy, Gemini, scoring, evaluation, or UI code, reads no
+environment variable, makes no external LLM call, and never produces a risk
+score or APPROVE/FLAG verdict.

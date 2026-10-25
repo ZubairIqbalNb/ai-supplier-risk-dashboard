@@ -2,13 +2,14 @@
 
 Phase 2 multi-source retrieval project for the AI Engineering Masters Program.
 
-**Current status: Modules 1–4.** The repository contains the project foundation
+**Current status: Modules 1–5.** The repository contains the project foundation
 and configuration layer, the Module 2 supplier data contracts and deterministic
 synthetic dataset, the Module 3 document-retrieval stack (document corpus,
 FAISS dense index, BM25 lexical index, and hybrid Reciprocal Rank Fusion
-retrieval), and the Module 4 Neo4j ownership graph with `query_graph(entity)`.
-SQLite population, parallel orchestration, DSPy synthesis, the judge metric, and
-the UI are **not** implemented yet.
+retrieval), the Module 4 Neo4j ownership graph with `query_graph(entity)`, and
+the Module 5 SQLite delivery/defect store, `query_sql(entity)`, and parallel
+three-source orchestration with `query_all_sources(entity)`. DSPy synthesis, the
+judge metric, and the UI are **not** implemented yet.
 
 ## Assignment domain
 
@@ -48,7 +49,9 @@ Copy `.env.example` to `.env` and fill in credentials locally. Never commit
 `.env`. The file is ignored by Git and should remain mode `600`.
 Module 3 does not read any environment variable. Module 4 reads only
 `NEO4J_URI`, `NEO4J_USER`, and `NEO4J_PASSWORD`; Docker Compose reads the same
-three values for the local service.
+three values for the local service. Module 5 adds no new variables: the SQLite
+store path defaults to `data/generated/suppliers.sqlite` and can be overridden
+per call.
 
 ## Environment variables
 
@@ -255,6 +258,71 @@ The live tests read `NEO4J_*` from `.env`, use a test-only `SUP-9xx` / `ORG-99x`
 namespace, and remove it afterwards. They never wipe the canonical development
 graph.
 
+## Module 5 structured retrieval and parallel orchestration
+
+Module 5 adds the third engine and the orchestration layer. The SQLite store
+holds only structured supplier facts — identity, partition, and one annual
+delivery/defect observation per supplier — in `suppliers` and `delivery_metrics`.
+Contract and complaint text stays in the Module 3 artifacts and ownership edges
+stay in the Module 4 graph, so no engine duplicates another engine's evidence.
+
+```bash
+uv run --locked python -m supplier_risk.sql.build   # or: make sql-build
+```
+
+The build writes `data/generated/suppliers.sqlite` (Git-ignored): it validates a
+deterministic load plan, inserts every row in one transaction, verifies the row
+counts, and replaces the file atomically. Rebuilding is the only supported way
+to refresh the store; a query never creates or modifies it.
+
+```python
+from supplier_risk.sql import query_sql
+from supplier_risk.orchestration import query_all_sources
+
+print(query_sql("SUP-001"))
+result = query_all_sources("SUP-007")
+print(result.outcome, result.failed_sources)
+print(result.sql.context)
+print(result.faiss.context)
+print(result.graph.context)
+```
+
+`query_all_sources(entity)` submits `query_sql`, `query_faiss`, and
+`query_graph` to a `ThreadPoolExecutor` before waiting for any of them, then
+collects each outcome independently. The result exposes the requested entity,
+three `SourceEvidence` sections in fixed `SQL` / `FAISS` / `GRAPH` order,
+per-source status (`ok`, `empty`, or `error`), the tagged error string when a
+source failed, per-source and overall elapsed time, and an `outcome` of
+`complete`, `partial`, or `failed`. `result.context()` joins the labeled sections
+without collapsing provenance, and no risk score or verdict is produced.
+
+| Situation | Result |
+|---|---|
+| All three succeed | `complete`; all three labeled contexts |
+| One source fails | `partial`; the other two contexts plus the tagged error |
+| Two sources fail | `partial`; the surviving context plus both tagged errors |
+| All three fail | `failed`; three tagged errors, no fabricated evidence |
+| A source has no evidence | `empty` for that source; still `complete`, never an error |
+
+SQLite opens one short-lived read-only connection per query, the FAISS and BM25
+indexes are only read, and Neo4j opens its own store per query, so the three
+default sources are safe to run concurrently. `timeout_seconds` bounds how long
+the orchestrator waits; it does not terminate a source call that is already
+running, so a timed-out source is reported as abandoned rather than killed.
+
+### Tests
+
+```bash
+uv run --locked pytest -q tests/test_sql_schema.py tests/test_sql_pipeline.py
+uv run --locked pytest -q tests/test_orchestration.py tests/test_orchestration_integration.py
+```
+
+The orchestration unit tests inject source callables and use
+`threading.Barrier` to prove concurrent submission without relying on sleeps.
+The offline integration tests run the real SQL and FAISS/BM25 engines with a
+graph store double; the live Neo4j test joins the real graph source and is
+opt-in with `SUPPLIER_RISK_NEO4J_TESTS=1`.
+
 ## Commands
 
 ```bash
@@ -264,6 +332,7 @@ make index            # build the Module 3 retrieval artifacts
 make neo4j-up         # start the local Neo4j service
 make neo4j-down       # stop the local Neo4j service without deleting data
 make graph-ingest     # load the canonical ownership graph
+make sql-build        # build the SQLite delivery/defect store
 make test             # run pytest
 make test-graph       # opt-in live Neo4j integration tests
 make test-real-model  # opt-in real embedding model smoke tests
@@ -292,9 +361,11 @@ Modules 1–2 cover the repository foundation, configuration, canonical supplier
 data contracts, and a deterministic synthetic dataset. Module 3 adds the
 document corpus, FAISS and BM25 indexes, RRF hybrid retrieval, metadata
 filtering, and `query_faiss(entity)`. Module 4 adds the Neo4j ownership graph,
-deterministic ingestion, and `query_graph(entity)`. SQLite population, parallel
-multi-engine orchestration, DSPy synthesis, the judge metric, and the UI remain
-future work and are not claimed here.
+deterministic ingestion, and `query_graph(entity)`. Module 5 adds the SQLite
+delivery/defect store, `query_sql(entity)`, and `query_all_sources(entity)`, the
+parallel three-source orchestrator with partial-failure tolerance. DSPy
+synthesis, the judge metric, and the UI remain future work and are not claimed
+here.
 
 Deployment is deferred until the missing “Vibe Coding Helper Doc” is supplied
 or deployment is explicitly waived.
@@ -320,7 +391,14 @@ or deployment is explicitly waived.
   replacement. A crash between files can leave a mixed set; the manifest is
   written last and the fingerprint, model, dimension, and count checks reject
   such a set instead of serving it.
-- The Neo4j driver is verified against Neo4j 5.26 Community; DSPy, Gemini
-  model access, and the remaining stores have not been verified.
-- `query_graph` is not yet orchestrated in parallel with the other engines, and
-  no cross-engine synthesis or verdict exists.
+- The Neo4j driver is verified against Neo4j 5.26 Community; DSPy and Gemini
+  model access have not been verified.
+- The SQLite store is a snapshot of one dataset build; a store built from a
+  different seed is not detected at query time, so rebuild it after regenerating
+  the dataset.
+- Orchestrator timeouts bound waiting, not execution: an abandoned source call
+  may keep running in its worker thread until it returns on its own. The first
+  concurrent FAISS query can also load the embedding model more than once
+  because the Module 3 embedder loads it lazily without a lock.
+- The orchestrator assembles evidence only; cross-engine synthesis and the
+  APPROVE / FLAG verdict belong to later modules.
