@@ -1,10 +1,10 @@
-# Supplier Data Schema (Modules 2–5)
+# Supplier Data Schema (Modules 2–6)
 
 **Project:** AI Supplier Risk Dashboard  
 **Phase:** Phase 2 — Multi-Source Retrieval  
 **Versions:** `module2.v1` (source dataset), `module3.v1` (retrieval artifacts), `module5.v1` (SQLite store), Neo4j graph schema from Module 4
 
-**Status:** Module 2 data foundation, Module 3 document retrieval, Module 4 ownership graph, and Module 5 SQL retrieval plus parallel orchestration implemented
+**Status:** Module 2 data foundation, Module 3 document retrieval, Module 4 ownership graph, Module 5 SQL retrieval plus parallel orchestration, and Module 6 structured verdict plus deterministic judge implemented
 
 This note defines the canonical raw supplier data used by later modules, the
 document-retrieval artifacts built from it, and the Neo4j ownership graph.
@@ -14,12 +14,14 @@ BM25 lexical index, and serves hybrid retrieval with Reciprocal Rank Fusion.
 Module 4 validates the ownership records and writes the supplier/company graph
 to Neo4j, with bounded `query_graph(entity)` retrieval. Module 5 adds the SQLite
 delivery/defect store, `query_sql(entity)`, and parallel three-source
-orchestration. No scoring, DSPy synthesis, judge, or UI exists.
+orchestration. Module 6 adds the DSPy `ChainOfThought` verdict module, the typed
+`SupplierRiskVerdict` contract, the `decide_supplier` path, and the deterministic
+rule-based judge. Risk scoring, optimizer compilation, and the UI do not exist.
 
 **Status legend**
 
 - **Mandated** — required by the assignment PDFs.
-- **Implemented** — present in Module 2–4 code and covered by tests.
+- **Implemented** — present in Module 2–6 code and covered by tests.
 - **Proposed** — future-store design recorded here; not implemented.
 - **Open** — requires a design decision or approval before implementation.
 
@@ -1006,7 +1008,8 @@ their supplier's partition and cannot move independently.
 | 24 suppliers, 14/4/6 split | Only ~20–30 and a held-out entity are mandated | Implemented; provisional counts | — |
 | Fixed id-to-partition mapping | Not specified | Implemented and enforced | Must preserve it |
 | SQLite tables | Store population mandated | Implemented in Module 5 (sections 8 and 11): suppliers plus delivery metrics | Contracts, complaints, and ownership links stay in their owning stores |
-| Parallel three-source retrieval | Parallel retrieval mandated | Implemented in Module 5 (section 11.3) | DSPy synthesis and the verdict remain later modules |
+| Parallel three-source retrieval | Parallel retrieval mandated | Implemented in Module 5 (section 11.3) | Module 6 consumes its result |
+| DSPy signature, one-call verdict, rule-based judge | Mandated (Guide Steps 5–6) | Implemented in Module 6 (section 15) | Optimizer compilation and held-out comparison (Module 7) |
 | FAISS documents, embeddings, index | Store population mandated | Implemented in Module 3 (section 9) | Complete for contracts and complaints |
 | BM25 lexical index and RRF hybrid retrieval | Hybrid BM25+dense required | Implemented in Module 3 (section 9) | Complete |
 | Neo4j nodes and edges | Store population mandated | Implemented in Module 4 (section 10) | Complete for the canonical ownership graph |
@@ -1065,6 +1068,19 @@ lets unexpected programming errors propagate. `query_all_sources` never raises
 a source failure: it isolates it, tags it with the source label, and continues
 collecting the other sources.
 
+### 13.3 Decision errors (Module 6)
+
+| Error | Raised for |
+|---|---|
+| `DecisionInputError` | Supplier identity is not a canonical `SUP-NNN` id, or an evidence context is blank or not a string |
+| `DecisionModelError` | The language-model call failed, timed out, or returned no prediction |
+| `DecisionResponseError` | Structured output is missing, malformed, or violates the verdict contract |
+| `SupplierMismatchError` | The retrieval result or the verdict names a different supplier than requested |
+
+These errors are raised instead of producing a verdict, so a model or provider
+failure can never become an `APPROVE`. Messages redact credential-like values
+and are truncated before they reach an exception or a log record.
+
 ## 14. Open decisions and limitations
 
 ### Open decisions requiring approval
@@ -1108,8 +1124,12 @@ collecting the other sources.
   structures are unsupported and must not be inferred from the code.
 - Empty complaints mean "no synthetic complaint record", not "no risk".
 - Modules 3–5 populate the document, graph, and SQLite stores and expose
-  parallel retrieval. Risk scoring, DSPy synthesis, the judge, and the UI are
-  not implemented.
+  parallel retrieval. Module 6 adds the verdict contract and the rule-based
+  judge. Risk scoring, optimizer compilation, held-out evaluation, and the UI
+  are not implemented.
+- The Module 6 verdict is not persisted: `DecisionResult`, `SupplierRiskVerdict`,
+  and `JudgeResult` are in-memory objects. Nothing here defines a database table
+  for decisions.
 - The SQLite store is a snapshot of one dataset build. Nothing detects a store
   built from a different seed at query time; rebuild it after regenerating the
   dataset, as with the Module 3 artifacts.
@@ -1131,3 +1151,80 @@ collecting the other sources.
   plays the same role for retrieval artifacts: any change to document identity,
   text construction, metadata fields, artifact layout, or index configuration
   requires a version bump and a rebuild.
+## 15. Implemented decision contract and judge (Module 6)
+
+**Status:** Implemented in `src/supplier_risk/decision/`. Nothing is persisted:
+the verdict and judgment are in-memory types returned by `decide_supplier`, and
+no database table is added.
+
+### 15.1 DSPy Signature
+
+`SupplierRiskSignature` has exactly three inputs, matching the three independent
+evidence stores, and five structured outputs.
+
+| Field | Direction | Contract |
+|---|---|---|
+| `sql_context` | input | Labeled `[SQL]` context or a `[SQL ERROR]` marker, passed through unchanged |
+| `faiss_context` | input | Labeled `[FAISS]` context or a `[FAISS ERROR]` marker, passed through unchanged |
+| `graph_context` | input | Labeled `[GRAPH]` context or a `[GRAPH ERROR]` marker, passed through unchanged |
+| `supplier_id` | output | `^SUP-\d{3}$`; must equal the requested supplier id |
+| `verdict` | output | `APPROVE` or `FLAG`; any other value is rejected |
+| `rationale` | output | 20–800 characters, trimmed and non-blank |
+| `findings` | output | 1–8 items, each 3–400 characters |
+| `missing_evidence` | output | 0–8 items, each 1–400 characters |
+
+The signature instructions require evidence-only reasoning, separation of
+adverse, favorable, and missing evidence, acknowledgement of conflicting or
+failed sources, conservative treatment of uncertainty, and a concise rationale
+grounded in the supplied contexts. There is no fourth context input.
+
+### 15.2 Verdict contract
+
+`SupplierRiskVerdict` is a frozen, `strict` Pydantic model with
+`extra="forbid"`. It intentionally has **no** risk score, confidence value,
+`evidence_status` enum, or citation object: the assignment does not require them,
+and an invented scale could not be validated.
+
+`parse_verdict_payload` accepts a mapping or an object with the contract fields as
+attributes (a `dspy.Prediction`). It normalizes the verdict and supplier-id case
+as well as surrounding whitespace, then rejects:
+
+- free-form text payloads,
+- missing required fields and unknown mapping keys,
+- a verdict other than `APPROVE` / `FLAG`,
+- blank values, out-of-range lengths, and too many findings,
+- a supplier id that is not `SUP-NNN`.
+
+`require_matching_supplier` rejects a verdict whose supplier id differs from the
+requested one. Error messages name field locations and never echo the model's
+rationale text.
+
+`SupplierRiskVerdict.to_dict()` is deterministic: declaration order is preserved,
+tuples become lists, and the output round-trips through `parse_verdict_payload`.
+The `reasoning` field that `dspy.ChainOfThought` always returns is deliberately
+excluded.
+
+### 15.3 Decision result
+
+`DecisionResult` keeps the complete Module 5 `OrchestrationResult` next to the
+validated verdict and the judge result, so no source provenance is collapsed.
+`to_dict()` exposes the retrieval outcome, per-source name, label, status,
+context, elapsed time and error, plus the verdict and judgment. This is the shape
+a future UI can render; no UI code exists in Module 6.
+
+### 15.4 Judge rules
+
+| Rule id | Condition | Effect |
+|---|---|---|
+| `decision_invalid` | No validated verdict was produced | Fails, final `FLAG` |
+| `supplier_identity_mismatch` | Verdict supplier differs from the requested id | Fails |
+| `unacknowledged_failed_source` | A failed source is not named in `missing_evidence` | Fails |
+| `retrieval_failed` | All three sources failed | Fails |
+| `no_evidence_for_approval` | `APPROVE` although no source returned evidence | Fails, final `FLAG` |
+| `banned_content` | A `BANNED_TERMS` term appears in the rationale or findings | Fails, final `FLAG` |
+
+`BANNED_TERMS` is the hard content rule from Guide Step 6: `sanction`,
+`blacklist`, `guarantee`, `no risk`, `zero risk`, `legal control`, and
+`clean record`. Matching is case-insensitive on word boundaries, so `sanctions`
+and `guaranteed` are caught. The judge is deterministic, imports no model
+library, and never upgrades a verdict.

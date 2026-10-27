@@ -79,6 +79,53 @@ class Neo4jSettings(BaseModel):
     __str__ = __repr__
 
 
+class LanguageModelSettings(BaseModel):
+    """Validated teacher/student language-model configuration for Module 6+.
+
+    The teacher and student roles are separate on purpose: Module 7 optimizes a
+    student program against a stronger teacher model, while the ordinary
+    decision path uses only the student role. Both model identifiers stay
+    configurable; no provider or model name is hardcoded in the decision layer.
+
+    The key is held as a :class:`pydantic.SecretStr` and is never included in
+    representations, error messages, or logs.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    api_key: SecretStr
+    teacher_model: str
+    student_model: str
+
+    @field_validator("api_key")
+    @classmethod
+    def _api_key_must_not_be_blank(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value().strip():
+            raise ValueError("GEMINI_API_KEY must not be blank")
+        return value
+
+    @field_validator("teacher_model", "student_model")
+    @classmethod
+    def _model_identifier_must_not_be_blank(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("model identifiers must not be blank")
+        return text
+
+    def masked(self) -> dict[str, str]:
+        """Return a display-safe representation without the API key."""
+        return {
+            "api_key": "***",
+            "teacher_model": self.teacher_model,
+            "student_model": self.student_model,
+        }
+
+    def __repr__(self) -> str:
+        return f"LanguageModelSettings({self.masked()!r})"
+
+    __str__ = __repr__
+
+
 class Settings(BaseModel):
     """Validated application configuration.
 
@@ -201,6 +248,49 @@ def load_settings(
             neo4j_user=(source.get("NEO4J_USER") or _DEFAULT_NEO4J_USER).strip(),
             neo4j_password=_optional_secret(source.get("NEO4J_PASSWORD")),
             log_level=log_level,
+        )
+    except ValidationError as error:
+        raise ConfigError(_sanitized_validation_message(error)) from None
+
+
+def load_language_model_settings(
+    env_file: str | Path | None = ".env",
+    environ: Mapping[str, str] | None = None,
+) -> LanguageModelSettings:
+    """Load and validate the teacher/student language-model configuration.
+
+    Reuses the same env-file and mapping conventions as the other loaders, and is
+    independent of the Neo4j and runtime settings. When ``environ`` is supplied,
+    the dotenv file is not read at all.
+
+    Raises:
+        ConfigError: if a required variable is missing or invalid. Error messages
+            name the variables only; values are never echoed.
+    """
+    source = _load_environment(env_file, environ)
+    api_key = (source.get("GEMINI_API_KEY") or "").strip()
+    teacher_model = (source.get("GEMINI_TEACHER_MODEL") or "").strip()
+    student_model = (source.get("GEMINI_STUDENT_MODEL") or "").strip()
+
+    missing = [
+        name
+        for name, value in (
+            ("GEMINI_API_KEY", api_key),
+            ("GEMINI_TEACHER_MODEL", teacher_model),
+            ("GEMINI_STUDENT_MODEL", student_model),
+        )
+        if not value
+    ]
+    if missing:
+        raise ConfigError(
+            "Missing or blank required environment variable(s): " + ", ".join(missing)
+        )
+
+    try:
+        return LanguageModelSettings(
+            api_key=SecretStr(api_key),
+            teacher_model=teacher_model,
+            student_model=student_model,
         )
     except ValidationError as error:
         raise ConfigError(_sanitized_validation_message(error)) from None

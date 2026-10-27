@@ -73,8 +73,10 @@ These decisions are engineering choices, not verified assignment requirements:
   Module 3 (`src/supplier_risk/retrieval/`).
 - Pydantic v2 contracts. Implemented in Module 2 (`src/supplier_risk/contracts.py`).
 - Streamlit as the UI framework.
-- 0–100 risk score, `evidence_status`, citation schema, summary length, and
-  banned-word list.
+- 0–100 risk score, `evidence_status`, and citation schema remain unimplemented
+  provisional choices.
+- Verdict field names, rationale/findings length bounds, and the banned-term
+  list are provisional choices implemented in Module 6.
 - Evidence-status behavior for missing or failed retrieval.
 - Timeout values and retry policy.
 - `all-MiniLM-L6-v2` (384 dimensions, CPU) as the embedding model. Implemented
@@ -300,3 +302,54 @@ Evidence:
 Module 5 adds no DSPy, Gemini, scoring, evaluation, or UI code, reads no
 environment variable, makes no external LLM call, and never produces a risk
 score or APPROVE/FLAG verdict.
+
+## Module 6 status
+
+Module 6 implements the DSPy Signature, the one-call ChainOfThought decision
+module, the typed verdict contract, the teacher/student LM configuration, and
+the deterministic rule-based judge. It does not implement optimization, a
+training set, teacher demonstrations, a compiled or saved student program,
+held-out comparison, or the UI; those remain Module 7 and later.
+
+Evidence:
+
+- **R-13 (implemented):** `SupplierRiskSignature`
+  (`src/supplier_risk/decision/signature.py`) has exactly three evidence inputs —
+  `sql_context`, `faiss_context`, and `graph_context` — and the structured
+  outputs `supplier_id`, `verdict`, `rationale`, `findings`, and
+  `missing_evidence`. `VerdictGenerator` (`decision/module.py`) wraps it in
+  `dspy.ChainOfThought` and makes exactly one prediction per request. Tests:
+  `tests/test_decision_signature.py`, `tests/test_decision_module.py`.
+- **R-14 (implemented for configuration):** `LanguageModelSettings` and
+  `load_language_model_settings()` (`src/supplier_risk/config.py`) validate
+  `GEMINI_TEACHER_MODEL` and `GEMINI_STUDENT_MODEL` separately;
+  `build_role_language_models()` (`decision/lm.py`) returns one `dspy.LM` per
+  role without global `dspy.configure`, so configuration cannot leak between
+  tests or requests. Tests: `tests/test_decision_lm.py`.
+- **R-15 (satisfied offline; live call unverified):** the decision module returns
+  contract-valid `APPROVE` and `FLAG` output end to end with a fake predictor.
+  No live Gemini call has been made, and no test requires one.
+- **R-16 (implemented):** `judge_verdict` and `judge_payload`
+  (`decision/judge.py`) validate structure through the verdict contract and
+  enforce `decision_invalid`, `supplier_identity_mismatch`,
+  `unacknowledged_failed_source`, `retrieval_failed`,
+  `no_evidence_for_approval`, and the hard `banned_content` rule
+  (`BANNED_TERMS`). Tests: `tests/test_decision_judge.py`.
+- **R-17 (demonstrated):** a deliberately bad verdict is rejected and, when it
+  was an `APPROVE`, downgraded to `FLAG`: a banned term, an invalid verdict
+  value, a mismatched supplier, an unacknowledged failed source, an approval
+  without evidence, and a fully failed retrieval all fail. The tests also assert
+  that the judge never upgrades a verdict and never invokes an LM.
+- **R-01 / R-03 (partially implemented):** the `APPROVE` / `FLAG` verdict and a
+  single structured synthesis call exist; the optimizer-compiled program that
+  R-03 ultimately requires is Module 7 work.
+- **R-30 (gate satisfied):** all three engines pass their own smoke tests, and
+  Module 6 consumes their Module 5 `OrchestrationResult` instead of querying any
+  store itself.
+- **R-26 (extended):** `docs/schema.md` section 15 documents the Signature
+  fields, verdict contract, decision result, and judge rules; section 13.3 lists
+  the decision-layer errors.
+
+Module 6 adds no optimizer, training-example generation, compiled state, UI,
+LLM-as-judge, retrieval-ranking change, graph-schema change, or persistent
+storage. Its tests are offline and read no `.env` value.

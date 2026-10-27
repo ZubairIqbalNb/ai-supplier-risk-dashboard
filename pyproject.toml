@@ -5,6 +5,7 @@ description = "AI Supplier Risk Dashboard: parallel multi-source retrieval with 
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "dspy>=3,<4",
     "faiss-cpu>=1.9,<2",
     "neo4j>=5.15,<6",
     "numpy>=1.26,<3",
@@ -62,6 +63,6 @@ check_untyped_defs = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-# rank_bm25 ships no type information and no py.typed marker.
-module = ["rank_bm25"]
+# rank_bm25 and dspy ship no type information and no py.typed marker.
+module = ["rank_bm25", "dspy"]
 ignore_missing_imports = true

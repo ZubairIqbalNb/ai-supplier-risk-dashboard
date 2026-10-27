@@ -2,14 +2,15 @@
 
 Phase 2 multi-source retrieval project for the AI Engineering Masters Program.
 
-**Current status: Modules 1–5.** The repository contains the project foundation
+**Current status: Modules 1–6.** The repository contains the project foundation
 and configuration layer, the Module 2 supplier data contracts and deterministic
 synthetic dataset, the Module 3 document-retrieval stack (document corpus,
 FAISS dense index, BM25 lexical index, and hybrid Reciprocal Rank Fusion
-retrieval), the Module 4 Neo4j ownership graph with `query_graph(entity)`, and
-the Module 5 SQLite delivery/defect store, `query_sql(entity)`, and parallel
-three-source orchestration with `query_all_sources(entity)`. DSPy synthesis, the
-judge metric, and the UI are **not** implemented yet.
+retrieval), the Module 4 Neo4j ownership graph with `query_graph(entity)`, the
+Module 5 SQLite delivery/defect store, `query_sql(entity)`, and parallel
+three-source orchestration with `query_all_sources(entity)`, and the Module 6
+DSPy structured verdict plus deterministic rule-based judge. DSPy optimization
+and compilation, held-out evaluation, and the UI are **not** implemented yet.
 
 ## Assignment domain
 
@@ -51,7 +52,9 @@ Module 3 does not read any environment variable. Module 4 reads only
 `NEO4J_URI`, `NEO4J_USER`, and `NEO4J_PASSWORD`; Docker Compose reads the same
 three values for the local service. Module 5 adds no new variables: the SQLite
 store path defaults to `data/generated/suppliers.sqlite` and can be overridden
-per call.
+per call. Module 6 reads `GEMINI_API_KEY`, `GEMINI_TEACHER_MODEL`, and
+`GEMINI_STUDENT_MODEL` only when `load_language_model_settings()` is called; its
+tests inject their own mappings and never read `.env`.
 
 ## Environment variables
 
@@ -323,6 +326,125 @@ The offline integration tests run the real SQL and FAISS/BM25 engines with a
 graph store double; the live Neo4j test joins the real graph source and is
 opt-in with `SUPPLIER_RISK_NEO4J_TESTS=1`.
 
+## Module 6 structured verdicts and deterministic judge
+
+Module 6 adds the decision layer on top of `query_all_sources`: one DSPy
+`ChainOfThought` call and one deterministic business-rule pass. There is no
+optimizer, no compiled student, no training set, no retry, no second model call,
+no agent loop, and no LLM-as-judge. Those belong to Module 7 or later.
+
+### DSPy Signature
+
+`SupplierRiskSignature` has exactly three evidence inputs and five structured
+outputs.
+
+| Direction | Field | Meaning |
+|---|---|---|
+| input | `sql_context` | Labeled `[SQL]` delivery/defect evidence or a `[SQL ERROR]` marker |
+| input | `faiss_context` | Labeled `[FAISS]` contract/complaint evidence or a `[FAISS ERROR]` marker |
+| input | `graph_context` | Labeled `[GRAPH]` ownership evidence or a `[GRAPH ERROR]` marker |
+| output | `supplier_id` | The `SUP-NNN` identity stated in the contexts; compared with the requested supplier |
+| output | `verdict` | `APPROVE` or `FLAG` |
+| output | `rationale` | Concise, evidence-grounded explanation (20–800 characters) |
+| output | `findings` | One to eight material evidence items naming their source |
+| output | `missing_evidence` | Failed, absent, or incomplete sources that materially affect the decision |
+
+The signature instructions require the model to use only the supplied evidence,
+separate adverse from favorable and missing evidence, acknowledge conflicts and
+failed sources, never treat a failed source as "no risk", and stay conservative
+under uncertainty. There is no fourth context: the three-source split is the
+architecture, not a convention.
+
+`SupplierRiskVerdict` is the validated contract behind those outputs. It is
+strict, frozen, forbids unknown fields, rejects any verdict other than
+`APPROVE` / `FLAG`, and rejects a different supplier id. No risk score or
+confidence value is invented.
+
+### One-call decision path
+
+```python
+import dspy
+
+from supplier_risk.config import load_language_model_settings
+from supplier_risk.decision import build_role_language_models, decide_supplier
+
+models = build_role_language_models(load_language_model_settings())
+with dspy.context(lm=models.student):
+    result = decide_supplier("SUP-007")
+
+print(result.retrieval.outcome)        # complete / partial / failed
+print(result.context["sql"])           # raw labeled SQL context
+print(result.verdict.verdict)          # model verdict
+print(result.final_verdict)            # judge's verdict
+print(result.judgment.triggered_rules)
+```
+
+`decide_supplier` accepts a canonical supplier id (`SUP-NNN`); legal-name
+resolution stays in the three store wrappers so identity comparison is exact. It
+either runs `query_all_sources(entity)` itself or accepts an existing
+`OrchestrationResult`. Exactly one prediction is made per request. A provider
+timeout, provider exception, missing prediction, malformed output, or unknown
+verdict raises a project error (`DecisionModelError`, `DecisionResponseError`,
+`SupplierMismatchError`) and never becomes an `APPROVE`. Provider error text is
+sanitized before it reaches an exception message or a log record.
+
+Partial retrieval keeps its provenance: a failed source reaches the model (and
+the result) as its tagged `[SQL ERROR]` / `[FAISS ERROR]` / `[GRAPH ERROR]`
+string, while the other sources keep their own labeled contexts.
+
+### Deterministic judge
+
+`judge_verdict(verdict, retrieval, requested_supplier_id=...)` is a pure
+business-rule check. It imports no DSPy module, calls no model, and is repeatable
+for identical inputs.
+
+| Rule | Meaning |
+|---|---|
+| `decision_invalid` | No usable validated verdict (missing, malformed, or outside the contract) |
+| `supplier_identity_mismatch` | The verdict names a different supplier than requested |
+| `unacknowledged_failed_source` | A failed source is not named in `missing_evidence` |
+| `retrieval_failed` | All three sources failed, so no verdict is verifiable |
+| `no_evidence_for_approval` | `APPROVE` although no source returned evidence |
+| `banned_content` | The hard content rule: banned terms appear in the rationale or findings |
+
+The banned-term rule is the Guide's Step 6 example ("at least one hard content
+rule (e.g. banned words)") and the list is fixed in
+`supplier_risk.decision.judge.BANNED_TERMS`: `sanction`, `blacklist`,
+`guarantee`, `no risk`, `zero risk`, `legal control`, and `clean record`. The
+three stores cannot establish those claims, so any occurrence fails the verdict.
+The judge never upgrades a verdict; a rejected `APPROVE` becomes `FLAG`.
+
+### Teacher and student models
+
+`load_language_model_settings()` reads `GEMINI_API_KEY`, `GEMINI_TEACHER_MODEL`,
+and `GEMINI_STUDENT_MODEL` through the existing configuration loader and raises a
+`ConfigError` naming any missing variable. `build_role_language_models()` returns
+two distinct, validated `dspy.LM` objects; a value without a provider prefix gets
+`gemini/`, and a value such as `openai/gpt-4o-mini` is used unchanged. Nothing
+calls `dspy.configure`, so the LM is scoped with `dspy.context` and cannot leak
+between tests or requests. Module 6 never calls the teacher; the ordinary
+decision path uses only the student role.
+
+### Tests
+
+```bash
+uv run --locked pytest -q \
+  tests/test_decision_signature.py tests/test_decision_module.py \
+  tests/test_decision_judge.py tests/test_decision_integration.py \
+  tests/test_decision_lm.py
+```
+
+All Module 6 tests are offline: a recording fake predictor replaces the LM, a
+fake LM factory replaces `dspy.LM`, and `tests/decision_support.py` builds
+Module 5 results and fake sources. No Docker, Neo4j, network, or credential is
+needed. The integration tests run the real Module 5 orchestrator over those fake
+sources.
+
+**Deferred to Module 7:** `BootstrapFewShot` (or another optimizer), teacher
+demonstrations, compiled/saved student state, held-out before/after comparison,
+and judge-driven optimization. Module 6 provides the signature, the one-call
+decision path, the verdict contract, and the judge those steps will use.
+
 ## Commands
 
 ```bash
@@ -353,6 +475,10 @@ make check            # lint + typecheck + test
 - Compose reads the same credentials from `.env`; no secret is committed.
 - Retrieved documents and ownership records are fictional synthetic data;
   retrieval errors never include credentials.
+- Module 6 reads no environment variable at import time.
+  `load_language_model_settings()` reads the three `GEMINI_*` values, holds the
+  key as `SecretStr`, and never prints it. The decision layer sanitizes provider
+  exception text and logs only supplier id, statuses, and character counts.
 - No secret values should appear in logs, documentation, or test output.
 
 ## Scope
@@ -363,17 +489,27 @@ document corpus, FAISS and BM25 indexes, RRF hybrid retrieval, metadata
 filtering, and `query_faiss(entity)`. Module 4 adds the Neo4j ownership graph,
 deterministic ingestion, and `query_graph(entity)`. Module 5 adds the SQLite
 delivery/defect store, `query_sql(entity)`, and `query_all_sources(entity)`, the
-parallel three-source orchestrator with partial-failure tolerance. DSPy
-synthesis, the judge metric, and the UI remain future work and are not claimed
-here.
+parallel three-source orchestrator with partial-failure tolerance. Module 6 adds
+the DSPy `ChainOfThought` verdict module, the strict `SupplierRiskVerdict`
+contract, the `decide_supplier` path, teacher/student LM configuration, and the
+deterministic rule-based judge. DSPy optimization and compilation, held-out
+evaluation, and the UI remain future work and are not claimed here.
 
 Deployment is deferred until the missing “Vibe Coding Helper Doc” is supplied
 or deployment is explicitly waived.
 
 ## Limitations
 
-- The 0–100 risk score, evidence-status field, citation schema, and banned-word
-  list are provisional engineering choices and are not implemented yet.
+- The verdict field names, the banned-term list, and the rationale/findings
+  length bounds are provisional engineering choices. The 0–100 risk score,
+  evidence-status field, and citation schema remain unimplemented.
+- Module 6 enforces the hard content rule as a fixed banned-term list. The
+  rationale and findings are not otherwise checked against the contexts: there
+  is no citation verifier, and the judge acknowledges a failed source only by
+  the source's name or `[LABEL]` tag in `missing_evidence`, without checking
+  that the item describes that source accurately.
+- ChainOfThought's `reasoning` field is discarded rather than audited; the
+  user-facing rationale is the model's summary, not verified internal reasoning.
 - The 24-supplier dataset and 14 train / 4 development / 6 held-out split are
   implemented but remain provisional design choices. The assignment only
   requires ~20–30 entities and a held-out entity outside training.
@@ -391,8 +527,11 @@ or deployment is explicitly waived.
   replacement. A crash between files can leave a mixed set; the manifest is
   written last and the fingerprint, model, dimension, and count checks reject
   such a set instead of serving it.
-- The Neo4j driver is verified against Neo4j 5.26 Community; DSPy and Gemini
-  model access have not been verified.
+- The Neo4j driver is verified against Neo4j 5.26 Community. DSPy 3.4.1 is
+  installed and exercised offline; live Gemini model access, optimizer
+  compilation, and held-out evaluation have not been verified.
+- A configured model name without a provider prefix is completed with `gemini/`.
+  Another provider must be named explicitly, for example `openai/gpt-4o-mini`.
 - The SQLite store is a snapshot of one dataset build; a store built from a
   different seed is not detected at query time, so rebuild it after regenerating
   the dataset.
@@ -401,4 +540,4 @@ or deployment is explicitly waived.
   concurrent FAISS query can also load the embedding model more than once
   because the Module 3 embedder loads it lazily without a lock.
 - The orchestrator assembles evidence only; cross-engine synthesis and the
-  APPROVE / FLAG verdict belong to later modules.
+  APPROVE / FLAG verdict live in `supplier_risk.decision`, one model call deep.
