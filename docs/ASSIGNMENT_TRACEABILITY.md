@@ -77,6 +77,14 @@ These decisions are engineering choices, not verified assignment requirements:
   provisional choices.
 - Verdict field names, rationale/findings length bounds, and the banned-term
   list are provisional choices implemented in Module 6.
+- The Module 7 expected-verdict label policy (`module7.labels.v1`,
+  `src/supplier_risk/optimization/labels.py`): `FLAG` when a supplier has any
+  `HIGH` severity complaint, a `defect_rate` above `0.02`, or an
+  `on_time_delivery_rate` below `0.85`; `APPROVE` otherwise. The assignment says
+  to reuse existing labels, but the canonical dataset's only label-like column is
+  `partition` (see Module 7 status). The policy is a deterministic function of
+  the supplier's own raw record only — never of retrieval output, a model, or an
+  evaluation result — so it cannot leak.
 - Evidence-status behavior for missing or failed retrieval.
 - Timeout values and retry policy.
 - `all-MiniLM-L6-v2` (384 dimensions, CPU) as the embedding model. Implemented
@@ -353,3 +361,127 @@ Evidence:
 Module 6 adds no optimizer, training-example generation, compiled state, UI,
 LLM-as-judge, retrieval-ranking change, graph-schema change, or persistent
 storage. Its tests are offline and read no `.env` value.
+
+## Module 7 status
+
+Module 7 implements the DSPy teacher/student optimization and evaluation
+workflow on top of Module 6: a deterministic expected-verdict label policy,
+dataset-to-example conversion that respects the existing partitions, a
+judge-backed metric, baseline and optimized held-out evaluation with a comparison
+report, real `dspy.BootstrapFewShot` compilation with the teacher/student roles,
+compiled-student persistence with secret-free metadata, and a CLI. It rebuilds no
+Module 6 component, reads no `.env` value in its tests, and records no API-backed
+run. Its components are `optimization/labels.py` (label policy), `examples.py`
+(dataset → `dspy.Example`, partition selection, dataset fingerprint), `metric.py`
+(judge-backed metric), `evaluation.py` (metrics, reports, comparison),
+`optimizer.py` (`dspy.BootstrapFewShot`), `persistence.py` (save/load),
+`cli.py` and `__main__.py` (workflow), and `errors.py`; orchestration,
+evaluation, and persistence are separate modules rather than one monolithic
+script. Design and limitations are recorded in this section.
+
+Evidence:
+
+- **R-18 (implemented):** `build_example_set` / `build_partition_examples`
+  (`src/supplier_risk/optimization/examples.py`) run the real Module 5
+  `query_all_sources` across the manifest and wrap each result as a
+  `dspy.Example` whose inputs are exactly the three Module 6 Signature contexts
+  and whose labels are the supplier id, the expected verdict, and the
+  `OrchestrationResult`. Tests: `tests/test_optimization_examples.py`.
+- **Label policy and measured distribution:** the canonical dataset carries no
+  `verdict`, `risk`, or `label` field, so `optimization/labels.py` derives the
+  expected verdict from the supplier's own raw record only (provisional
+  register). Under that policy the dataset with fingerprint
+  `f48bb5006c19d03ed11386db1591cb07244040b7f68b95b2e91d664cb37781e1` labels
+  train 14 suppliers → 4 `APPROVE` / 10 `FLAG`, dev 4 → 3 / 1, and held-out
+  6 → 0 / 6. Tests: `tests/test_optimization_labels.py`.
+- **R-19 (implemented):** `build_bootstrap_optimizer` / `optimize_student`
+  (`optimization/optimizer.py`) build and run `dspy.BootstrapFewShot` — verified
+  as a real instance with the required configuration — under
+  `dspy.context(lm=student)` with the teacher LM passed via `teacher_settings`.
+  The compiled state is saved with `dspy.Module.save`. Tests:
+  `tests/test_optimization_optimizer.py`, `tests/test_optimization_persistence.py`.
+- **Optimizer configuration:** `OptimizerSettings` validates
+  `max_bootstrapped_demos=4`, `max_labeled_demos=0`, `max_rounds=1`,
+  `max_errors=None`, `metric_threshold=None`, optional `train_limit`/`dev_limit`,
+  and `seed=0` before any model call. `max_labeled_demos=0` is deliberate:
+  BootstrapFewShot would otherwise seed the prompt with raw training examples,
+  which carry no gold rationale or findings, so every demonstration is instead
+  bootstrapped from a teacher trace the deterministic judge accepted. Teacher and
+  student roles follow Module 6: the teacher LM is passed through
+  `teacher_settings` and the whole compilation runs inside
+  `dspy.context(lm=student)`, with no global `dspy.configure`, so the optimized
+  program uses the student LM and configuration cannot leak. DSPy 3.4.1's
+  `BootstrapFewShot` exposes no seed argument and shuffles its own validation
+  split with a fixed `random.Random(0)`; remote model calls remain
+  nondeterministic, which is stated rather than claimed away.
+- **R-20 (partially demonstrated):** the saved optimized state file exists and is
+  reloadable, and the offline tests confirm `BootstrapFewShot` bootstraps real
+  demonstrations. A live student reasoning trace requires a model API call and is
+  not recorded in this change set.
+- **Persistence layout:** `optimization/persistence.py` writes
+  `artifacts/optimization/optimized_student.json` (the compiled state, via
+  `dspy.Module.save`) alongside `optimized_student.metadata.json` — artifact
+  format version, DSPy version, teacher/student model identifiers, optimizer
+  configuration, label policy, dataset schema version/seed/fingerprint, partition
+  membership, compilation timestamp, and a metrics summary. Only model
+  identifiers are recorded, never API keys or authorization headers (`BaseLM`
+  state excludes them); a test sets a sentinel key and asserts it never reaches
+  disk. `load_compiled_student` restores the state without recompiling (a test
+  makes `BootstrapFewShot.compile` raise) and `load_and_verify` runs one
+  representative input. The artifact is portable only within a compatible DSPy
+  and provider/model environment; `dspy.Module.load` warns on a dependency-version
+  mismatch and cross-version portability is not claimed.
+- **R-21 (implemented with a reported limitation; no improvement claimed):**
+  the uncompiled and compiled programs are evaluated on the *same* held-out
+  examples in the same order (`optimization/evaluation.py`). Under the Module 7
+  label policy the held-out partition is single-class (`FLAG` only), so its
+  APPROVE precision/recall/F1 are mathematically undefined and are returned as
+  `null` rather than coerced to `0.0`, and its accuracy is trivially satisfiable
+  by a `FLAG`-only program; the CLI also reports a secondary development
+  comparison, which has both classes. The report carries totals, structurally
+  valid/invalid/accepted/correct/incorrect counts, judge rejections, per-class
+  precision/recall/F1, accuracy, mean score, macro-F1 (the arithmetic mean of the
+  two class F1 values, `null` whenever either is undefined, so a single-class
+  evaluation is never reported as a two-class score), and a stable per-example
+  outcome list. `compare_reports` first verifies that both reports cover the same
+  partition and the same supplier ids — a pair that does not is rejected with
+  `ComparisonError` rather than labelled improved, regressed, or unchanged — then
+  derives improved/regressed/unchanged from accuracy, and it never asserts that
+  optimization helps. No measurable improvement is claimed without a real
+  API-backed run.
+- **R-13 / R-14 / R-16 (reused, not redefined):** the Signature, the
+  teacher/student configuration, and the deterministic judge are consumed
+  unchanged; the metric in `optimization/metric.py` is a thin wrapper over
+  `judge_payload` and is asserted to call no language model. It validates the
+  prediction, applies the judge with the example's real `OrchestrationResult`, and
+  scores `1.0` only when the output parses, the judge accepts it, and the
+  validated verdict equals the expected label; malformed output, an identity
+  mismatch, a banned term, an unacknowledged failed source, an approval without
+  evidence, and a valid but wrong verdict all score `0.0`, so rule-breaking output
+  cannot score by claiming the right verdict. Tests:
+  `tests/test_optimization_metric.py`.
+- **R-03 (reused):** the optimizer-compiled program the assignment requires now
+  exists; a compiled, evaluated run against a live model remains a user action.
+- **CLI / developer workflow:** `python -m supplier_risk.optimization` (also
+  `make optimize`) validates configuration first, with `--check-config` exiting
+  without any model or retrieval call, announces that real model API calls will
+  occur, runs the baseline, compiles with `BootstrapFewShot`, re-evaluates the
+  same held-out examples, and writes the artifact plus `evaluation_results.json`,
+  returning a nonzero status for a configuration (`2`) or
+  compilation/persistence (`1`) failure. `make check` remains lint, typecheck, and
+  the offline test suite and never triggers a remote LLM call. Tests:
+  `tests/test_optimization_cli.py`; `tests/test_optimization_workflow.py` runs the
+  real `BootstrapFewShot` through the full baseline → compile → optimized flow
+  with `dspy.utils.dummies.DummyLM` as the only model boundary.
+- **R-26 (extended):** this section records the Module 7 label policy, metric
+  scoring policy, optimizer configuration, artifact metadata, and
+  reload/compatibility limitations. Module 7 keeps no separate module document,
+  matching Modules 1–6, whose status lives here.
+
+Limitations reported, not hidden: the Module 2 dataset carries no verdict labels,
+so Module 7 defines a documented provisional label policy; the held-out partition
+is single-class under that policy; and remote model APIs remain nondeterministic.
+The dataset, retrieval artifacts, and Neo4j data are not modified.
+
+Module 7 adds no UI, no README change, no caching, no observability, and no new
+dependency. Its tests are offline and deterministic.

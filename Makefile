@@ -1,4 +1,4 @@
-.PHONY: install lock index graph-ingest sql-build neo4j-up neo4j-down test test-graph test-real-model lint typecheck check
+.PHONY: install lock index graph-ingest sql-build neo4j-up neo4j-down optimize test test-graph test-real-model lint typecheck check
 
 install:
 	uv sync --locked --group dev
@@ -20,6 +20,11 @@ graph-ingest:
 
 sql-build:
 	uv run --locked python -m supplier_risk.sql.build
+
+# Module 7: compile the DSPy student with BootstrapFewShot and evaluate it.
+# This makes real language-model API calls; `make check` does not.
+optimize:
+	uv run --locked python -m supplier_risk.optimization
 
 test:
 	uv run --locked pytest -q
